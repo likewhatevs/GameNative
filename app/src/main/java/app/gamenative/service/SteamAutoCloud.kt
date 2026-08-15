@@ -7,6 +7,7 @@ import app.gamenative.data.PostSyncInfo
 import app.gamenative.data.SaveFilePattern
 import app.gamenative.data.SteamApp
 import app.gamenative.data.SteamFileHashCache
+import app.gamenative.data.UFS
 import app.gamenative.data.UserFileInfo
 import app.gamenative.data.UserFilesDownloadResult
 import app.gamenative.data.UserFilesUploadResult
@@ -69,6 +70,34 @@ import java.util.concurrent.atomic.AtomicLong
 object SteamAutoCloud {
 
     private const val MAX_USER_FILE_RETRIES = 3
+
+    /**
+     * Steamworks documents 100 MB as the maximum size of a single Steam Cloud file. Staying under
+     * it also keeps the file size within the Int that beginFileUpload takes, which would otherwise
+     * wrap for a file above 2 GiB.
+     */
+    internal const val MAX_CLOUD_FILE_SIZE_BYTES: Long = 100L * 1024 * 1024
+
+    /**
+     * Checks a would-be cloud file set against the per-app quota the app declares in its ufs
+     * appinfo section, returning a description of the violation or null if the set fits.
+     *
+     * The file count is checked first: a save directory holds far more files than bytes relative
+     * to its limits, so an over-collecting sweep runs out of files long before it runs out of
+     * space. A limit of zero means the app declares none.
+     *
+     * This is the app's declared limit, not the account's current usage, so it does not account
+     * for files another device left in the cloud.
+     */
+    internal fun checkQuota(ufs: UFS, fileCount: Int, totalBytes: Long): String? {
+        if (ufs.maxNumFiles > 0 && fileCount > ufs.maxNumFiles) {
+            return "$fileCount file(s) exceeds the app's limit of ${ufs.maxNumFiles}"
+        }
+        if (ufs.quota > 0 && totalBytes > ufs.quota) {
+            return "$totalBytes byte(s) exceeds the app's quota of ${ufs.quota}"
+        }
+        return null
+    }
 
     internal data class HashLookupResult(
         val sha: ByteArray,
@@ -601,13 +630,24 @@ object SteamAutoCloud {
                 filesToUpload.map { it.second }.forEachIndexed { index, file ->
                     val absFilePath = file.getAbsPath(prefixToPath)
 
-                    val fileSize = try {
-                        Files.size(absFilePath).toInt()
+                    val fileSizeBytes = try {
+                        Files.size(absFilePath)
                     } catch (e: Exception) {
                         Timber.w("Skipping upload of ${file.prefixPath}: ${e.javaClass.simpleName}: ${e.message}")
                         uploadBatchSuccess = false
                         return@forEachIndexed
                     }
+
+                    if (fileSizeBytes > MAX_CLOUD_FILE_SIZE_BYTES) {
+                        Timber.w(
+                            "Skipping upload of ${file.prefixPath}: $fileSizeBytes byte(s) is over " +
+                                "the $MAX_CLOUD_FILE_SIZE_BYTES byte Steam Cloud per-file limit",
+                        )
+                        uploadBatchSuccess = false
+                        return@forEachIndexed
+                    }
+
+                    val fileSize = fileSizeBytes.toInt()
 
                     Timber.i("Beginning upload of ${file.prefixPath} whose timestamp is ${file.timestamp}")
 
@@ -907,6 +947,26 @@ object SteamAutoCloud {
                     }
 
                     uploadsRequired = fileChanges.filesCreated.isNotEmpty() || fileChanges.filesModified.isNotEmpty()
+
+                    // Check up front rather than discovering the limit part-way through a batch:
+                    // everything committed before that point is already on the server and still
+                    // counts. The local set is what the cloud ends up holding after a sync, so
+                    // that is what gets measured.
+                    val quotaViolation = checkQuota(
+                        ufs = appInfo.ufs,
+                        fileCount = allLocalUserFiles.size,
+                        totalBytes = allLocalUserFiles.sumOf { userFile ->
+                            runCatching { Files.size(userFile.getAbsPath(prefixToPath)) }.getOrDefault(0L)
+                        },
+                    )
+
+                    if (quotaViolation != null) {
+                        Timber.e("Not uploading save files of ${appInfo.name}: $quotaViolation")
+                        uploadsCompleted = false
+                        filesManaged = allLocalUserFiles.size
+                        syncResult = SyncResult.QuotaExceeded
+                        return@async
+                    }
 
                     val uploadResult: UserFilesUploadResult
 
