@@ -738,8 +738,9 @@ object SteamAutoCloud {
 
                                 if (!response.isSuccessful) {
                                     Timber.w(
-                                        "Failed to upload part of %s: %s, %s",
+                                        "Failed to upload part of %s: HTTP %d %s, %s",
                                         file.prefixPath,
+                                        response.code,
                                         response.message,
                                         response?.body.toString(),
                                     )
