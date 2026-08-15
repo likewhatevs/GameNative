@@ -604,6 +604,15 @@ object SteamAutoCloud {
                     appBuildId = appInfo.branches[SteamService.getInstalledApp(appInfo.id)?.branch ?: "public"]?.buildId ?: 0,
                 ).await()
 
+                // AppUploadBatchResponse does not expose the response EResult, so an unset batch id
+                // is the only signal we get that Steam refused to open the batch. Uploading into it
+                // would be a no-op, and there is no batch to complete afterwards.
+                if (uploadBatchResponse.batchID == 0L) {
+                    Timber.e("Steam did not open an upload batch for ${appInfo.id}, aborting upload")
+
+                    return@async UserFilesUploadResult(false, uploadBatchResponse.appChangeNumber, 0, 0L)
+                }
+
                 var uploadBatchSuccess = true
 
                 filesToUpload.map { it.second }.forEachIndexed { index, file ->
@@ -651,6 +660,15 @@ object SteamAutoCloud {
                     var bytesUploadedForFile = 0L
                     var lastReportedProgress = -1f
                     val progressThreshold = 0.01f // Update every 1% change
+
+                    // A file with content and no block requests transfers nothing. Without this the
+                    // loop below is a no-op and the file still counts as uploaded.
+                    if (fileSize > 0 && uploadInfo.blockRequests.isEmpty()) {
+                        Timber.w("Steam returned no block requests for ${file.prefixPath}")
+
+                        uploadFileSuccess = false
+                        uploadBatchSuccess = false
+                    }
 
                     RandomAccessFile(absFilePath.pathString, "r").use { fs ->
                         uploadInfo.blockRequests.forEach { blockRequest ->
@@ -744,11 +762,6 @@ object SteamAutoCloud {
                         }
                     }
 
-                    if (uploadFileSuccess) {
-                        filesUploaded++
-                        bytesUploaded += fileSize
-                    }
-
                     val commitSuccess = steamCloud.commitFileUpload(
                         transferSucceeded = uploadFileSuccess,
                         appId = appInfo.id,
@@ -771,6 +784,13 @@ object SteamAutoCloud {
                     ).await()
 
                     Timber.i("File ${file.prefixPath} commit success: $commitSuccess")
+
+                    if (!commitSuccess) {
+                        uploadBatchSuccess = false
+                    } else if (uploadFileSuccess) {
+                        filesUploaded++
+                        bytesUploaded += fileSize
+                    }
                 }
 
                 steamCloud.completeAppUploadBatch(
@@ -922,12 +942,21 @@ object SteamAutoCloud {
                         uploadResult = uploadFiles(fileChanges, parentScope).await()
                         filesUploaded = uploadResult.filesUploaded
                         bytesUploaded = uploadResult.bytesUploaded
-                        uploadsCompleted = uploadsRequired && uploadResult.uploadBatchSuccess
                     }.inWholeMicroseconds
+
+                    // Recording the file list against change number 0 would leave us permanently
+                    // behind the cloud, turning every later sync into a conflict.
+                    val uploadRecorded = uploadResult.uploadBatchSuccess && uploadResult.appChangeNumber > 0
+
+                    if (uploadResult.uploadBatchSuccess && !uploadRecorded) {
+                        Timber.e("Upload batch succeeded with change number ${uploadResult.appChangeNumber}, discarding")
+                    }
+
+                    uploadsCompleted = uploadsRequired && uploadRecorded
 
                     filesManaged = allLocalUserFiles.size
 
-                    if (uploadResult.uploadBatchSuccess) {
+                    if (uploadRecorded) {
                         lastCloudAppChangeNumber = uploadResult.appChangeNumber
                         with(steamInstance) {
                             db.withTransaction {
