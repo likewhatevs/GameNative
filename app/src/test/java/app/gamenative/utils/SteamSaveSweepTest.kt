@@ -13,6 +13,10 @@ import org.robolectric.RobolectricTestRunner
 /**
  * Covers the file selection a Steam Auto-Cloud `ufs.savefiles` rule describes: `pattern` filters
  * by file name, `recursive` decides whether subdirectories are candidates at all.
+ *
+ * The directory layouts here follow Dome Keeper (appid 1637320), whose three rules are all
+ * non-recursive with pattern `*.*` while Godot keeps its caches in subdirectories of the same
+ * save directory.
  */
 @RunWith(RobolectricTestRunner::class)
 class SteamSaveSweepTest {
@@ -43,6 +47,16 @@ class SteamSaveSweepTest {
         SteamSaveSweep.findSaveFiles(baseDir.toPath(), pattern, recursive)
             .map { baseDir.toPath().relativize(it).toString() }
             .toSet()
+
+    /** Dome Keeper's layout: saves in the rule's own directory, Godot's caches below it. */
+    private fun writeDomeKeeperLayout() {
+        write("savegame_0.json")
+        write("options.txt")
+        write("singleplayer/savegame_1.json")
+        write("shader_cache/CanvasOcclusion/9f2c/1a4b.vulkan.cache")
+        write("vulkan/pipelines.forward_plus.adreno.cache")
+        write("logs/godot.log")
+    }
 
     // ── pattern matching ──────────────────────────────────────────────────────────────────
 
@@ -97,24 +111,47 @@ class SteamSaveSweepTest {
         assertFalse(SteamSaveSweep.matchesPattern("a.sav", ""))
     }
 
+    // ── engine cache deny-list ────────────────────────────────────────────────────────────
+
+    @Test
+    fun engineArtefactsAreDenied() {
+        assertTrue(SteamSaveSweep.isEngineCache("shader_cache/CanvasOcclusion/9f2c/1a4b.vulkan.cache"))
+        assertTrue(SteamSaveSweep.isEngineCache("vulkan/pipelines.forward_plus.adreno.cache"))
+        assertTrue(SteamSaveSweep.isEngineCache("logs/godot.log"))
+        assertTrue(SteamSaveSweep.isEngineCache("Saved\\Logs\\game.log"))
+        assertTrue(SteamSaveSweep.isEngineCache("Saved/Crashes/UECC-1/report.txt"))
+        assertTrue(SteamSaveSweep.isEngineCache(".godot/uid_cache.bin"))
+        assertTrue(SteamSaveSweep.isEngineCache("Cache/atlas.bin"))
+        assertTrue(SteamSaveSweep.isEngineCache("pipelines.cache"))
+    }
+
+    @Test
+    fun plausibleSaveFilesAreNotDenied() {
+        assertFalse(SteamSaveSweep.isEngineCache("savegame_0.json"))
+        assertFalse(SteamSaveSweep.isEngineCache("options.txt"))
+        assertFalse(SteamSaveSweep.isEngineCache("singleplayer/savegame_1.json"))
+        assertFalse(SteamSaveSweep.isEngineCache("multiplayer/logbook.sav"))
+        assertFalse(SteamSaveSweep.isEngineCache("DailyChallengesCache.dat"))
+        assertFalse(SteamSaveSweep.isEngineCache("playerachievementcache.dat"))
+        assertFalse(SteamSaveSweep.isEngineCache("player.log"))
+        assertFalse("only the path below the rule's directory is inspected", SteamSaveSweep.isEngineCache("godot.log"))
+    }
+
     // ── sweep ─────────────────────────────────────────────────────────────────────────────
 
     @Test
     fun nonRecursiveRuleIgnoresSubdirectories() {
-        write("savegame_0.json")
-        write("options.txt")
-        write("singleplayer/savegame_1.json")
+        writeDomeKeeperLayout()
 
         assertEquals(setOf("savegame_0.json", "options.txt"), sweep(pattern = "*.*", recursive = false))
     }
 
     @Test
-    fun recursiveRuleDescendsIntoSubdirectories() {
-        write("savegame_0.json")
-        write("singleplayer/savegame_1.json")
+    fun recursiveRuleDescendsButStillDropsEngineCaches() {
+        writeDomeKeeperLayout()
 
         assertEquals(
-            setOf("savegame_0.json", File("singleplayer/savegame_1.json").path),
+            setOf("savegame_0.json", "options.txt", File("singleplayer/savegame_1.json").path),
             sweep(pattern = "*.*", recursive = true),
         )
     }
