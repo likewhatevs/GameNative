@@ -53,7 +53,9 @@ import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.future.await
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.TimeoutCancellationException
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import okhttp3.Headers
 import okhttp3.MediaType.Companion.toMediaTypeOrNull
@@ -615,190 +617,205 @@ object SteamAutoCloud {
 
                 var uploadBatchSuccess = true
 
-                filesToUpload.map { it.second }.forEachIndexed { index, file ->
-                    val absFilePath = file.getAbsPath(prefixToPath)
+                try {
+                    filesToUpload.map { it.second }.forEachIndexed { index, file ->
+                        val absFilePath = file.getAbsPath(prefixToPath)
 
-                    val fileSize = try {
-                        Files.size(absFilePath).toInt()
-                    } catch (e: Exception) {
-                        Timber.w("Skipping upload of ${file.prefixPath}: ${e.javaClass.simpleName}: ${e.message}")
-                        uploadBatchSuccess = false
-                        return@forEachIndexed
-                    }
+                        val fileSize = try {
+                            Files.size(absFilePath).toInt()
+                        } catch (e: Exception) {
+                            Timber.w("Skipping upload of ${file.prefixPath}: ${e.javaClass.simpleName}: ${e.message}")
+                            uploadBatchSuccess = false
+                            return@forEachIndexed
+                        }
 
-                    Timber.i("Beginning upload of ${file.prefixPath} whose timestamp is ${file.timestamp}")
+                        Timber.i("Beginning upload of ${file.prefixPath} whose timestamp is ${file.timestamp}")
 
-                    // Report start of upload
-                    onProgress?.invoke("Uploading ${file.filename}", 0f)
+                        // Report start of upload
+                        onProgress?.invoke("Uploading ${file.filename}", 0f)
 
-                    val uploadInfo = steamCloud.beginFileUpload(
-                        appId = appInfo.id,
-                        filename = if (appInfo.ufs.saveFilePatterns.isEmpty()) {
-                            // For SteamUserData files, use just the filename without folder prefix
-                            if (file.root == PathType.SteamUserData) {
-                                file.filename
-                            } else {
-                                file.path + file.filename
-                            }
-                        } else {
-                            // For SteamUserData files, use just the filename to avoid folder prefix
-                            if (file.root == PathType.SteamUserData) {
-                                file.filename
-                            } else {
-                                file.prefixPath
-                            }
-                        },
-                        fileSize = fileSize,
-                        rawFileSize = fileSize,
-                        fileSha = file.sha,
-                        // timestamp = prootTimestampToDate(file.timestamp),
-                        timestamp = Date(file.timestamp),
-                        uploadBatchId = uploadBatchResponse.batchID,
-                    ).await()
-
-                    var uploadFileSuccess = true
-                    var bytesUploadedForFile = 0L
-                    var lastReportedProgress = -1f
-                    val progressThreshold = 0.01f // Update every 1% change
-
-                    // A file with content and no block requests transfers nothing. Without this the
-                    // loop below is a no-op and the file still counts as uploaded.
-                    if (fileSize > 0 && uploadInfo.blockRequests.isEmpty()) {
-                        Timber.w("Steam returned no block requests for ${file.prefixPath}")
-
-                        uploadFileSuccess = false
-                        uploadBatchSuccess = false
-                    }
-
-                    RandomAccessFile(absFilePath.pathString, "r").use { fs ->
-                        uploadInfo.blockRequests.forEach { blockRequest ->
-                            val httpUrl = buildUrl(
-                                blockRequest.useHttps,
-                                blockRequest.urlHost,
-                                blockRequest.urlPath,
-                            )
-
-                            Timber.i("Uploading to $httpUrl")
-                            Timber.i(
-                                "Block Request:" +
-                                    "\n\tblockOffset: ${blockRequest.blockOffset}" +
-                                    "\n\tblockLength: ${blockRequest.blockLength}" +
-                                    "\n\trequestHeaders:\n\t\t${
-                                        blockRequest.requestHeaders.joinToString("\n\t\t") { "${it.name}: ${it.value}" }
-                                    }" +
-                                    "\n\texplicitBodyData: [${
-                                        blockRequest.explicitBodyData.joinToString(
-                                            ", ",
-                                        )
-                                    }]" +
-                                    "\n\tmayParallelize: ${blockRequest.mayParallelize}",
-                            )
-
-                            val byteArray = ByteArray(blockRequest.blockLength)
-
-                            fs.seek(blockRequest.blockOffset)
-
-                            val bytesRead = fs.read(byteArray, 0, blockRequest.blockLength)
-
-                            Timber.i("Read $bytesRead byte(s) for block")
-
-                            val mediaType = if (blockRequest.requestHeaders.any { it.name.equals("Content-Type", ignoreCase = true) }) {
-                                blockRequest.requestHeaders.first { it.name.equals("Content-Type", ignoreCase = true) }.value.toMediaTypeOrNull()
-                            } else {
-                                "application/octet-stream".toMediaTypeOrNull()
-                            }
-
-                            val requestBody = byteArray.toRequestBody(mediaType)
-
-                            // val requestBody = byteArray.toRequestBody()
-
-                            val headers = Headers.headersOf(
-                                *blockRequest.requestHeaders
-                                    .map { listOf(it.name, it.value) }
-                                    .flatten()
-                                    .toTypedArray(),
-                            )
-
-                            val request = Request.Builder()
-                                .url(httpUrl)
-                                .put(requestBody)
-                                .headers(headers)
-                                .addHeader("Accept", "text/html,*/*;q=0.9")
-                                .addHeader("accept-encoding", "gzip,identity,*;q=0")
-                                .addHeader("accept-charset", "ISO-8859-1,utf-8,*;q=0.7")
-                                .addHeader("user-agent", "Valve/Steam HTTP Client 1.0")
-                                .build()
-
-                            val httpClient = steamInstance.steamClient!!.configuration.httpClient
-
-                            Timber.i("Sending request to ${request.url} using\n$request")
-
-                            withTimeout(SteamService.requestTimeout) {
-                                val response = httpClient.newCall(request).execute()
-
-                                if (!response.isSuccessful) {
-                                    Timber.w(
-                                        "Failed to upload part of %s: HTTP %d %s, %s",
-                                        file.prefixPath,
-                                        response.code,
-                                        response.message,
-                                        response?.body.toString(),
-                                    )
-
-                                    uploadFileSuccess = false
-                                    uploadBatchSuccess = false
+                        val uploadInfo = steamCloud.beginFileUpload(
+                            appId = appInfo.id,
+                            filename = if (appInfo.ufs.saveFilePatterns.isEmpty()) {
+                                // For SteamUserData files, use just the filename without folder prefix
+                                if (file.root == PathType.SteamUserData) {
+                                    file.filename
                                 } else {
-                                    // Update progress after successful block upload
-                                    bytesUploadedForFile += blockRequest.blockLength
-                                    if (fileSize > 0) {
-                                        val currentProgress = (bytesUploadedForFile.toFloat() / fileSize).coerceIn(0f, 1f)
-                                        // Only update if progress changed by at least 1% or we're at 100%
-                                        if (currentProgress - lastReportedProgress >= progressThreshold || currentProgress >= 1f) {
-                                            onProgress?.invoke("Uploading ${file.filename}", currentProgress)
-                                            lastReportedProgress = currentProgress
+                                    file.path + file.filename
+                                }
+                            } else {
+                                // For SteamUserData files, use just the filename to avoid folder prefix
+                                if (file.root == PathType.SteamUserData) {
+                                    file.filename
+                                } else {
+                                    file.prefixPath
+                                }
+                            },
+                            fileSize = fileSize,
+                            rawFileSize = fileSize,
+                            fileSha = file.sha,
+                            // timestamp = prootTimestampToDate(file.timestamp),
+                            timestamp = Date(file.timestamp),
+                            uploadBatchId = uploadBatchResponse.batchID,
+                        ).await()
+
+                        var uploadFileSuccess = true
+                        var bytesUploadedForFile = 0L
+                        var lastReportedProgress = -1f
+                        val progressThreshold = 0.01f // Update every 1% change
+
+                        // A file with content and no block requests transfers nothing. Without this the
+                        // loop below is a no-op and the file still counts as uploaded.
+                        if (fileSize > 0 && uploadInfo.blockRequests.isEmpty()) {
+                            Timber.w("Steam returned no block requests for ${file.prefixPath}")
+
+                            uploadFileSuccess = false
+                            uploadBatchSuccess = false
+                        }
+
+                        RandomAccessFile(absFilePath.pathString, "r").use { fs ->
+                            uploadInfo.blockRequests.forEach { blockRequest ->
+                                val httpUrl = buildUrl(
+                                    blockRequest.useHttps,
+                                    blockRequest.urlHost,
+                                    blockRequest.urlPath,
+                                )
+
+                                Timber.i("Uploading to $httpUrl")
+                                Timber.i(
+                                    "Block Request:" +
+                                        "\n\tblockOffset: ${blockRequest.blockOffset}" +
+                                        "\n\tblockLength: ${blockRequest.blockLength}" +
+                                        "\n\trequestHeaders:\n\t\t${
+                                            blockRequest.requestHeaders.joinToString("\n\t\t") { "${it.name}: ${it.value}" }
+                                        }" +
+                                        "\n\texplicitBodyData: [${
+                                            blockRequest.explicitBodyData.joinToString(
+                                                ", ",
+                                            )
+                                        }]" +
+                                        "\n\tmayParallelize: ${blockRequest.mayParallelize}",
+                                )
+
+                                val byteArray = ByteArray(blockRequest.blockLength)
+
+                                fs.seek(blockRequest.blockOffset)
+
+                                val bytesRead = fs.read(byteArray, 0, blockRequest.blockLength)
+
+                                Timber.i("Read $bytesRead byte(s) for block")
+
+                                val mediaType = if (blockRequest.requestHeaders.any { it.name.equals("Content-Type", ignoreCase = true) }) {
+                                    blockRequest.requestHeaders.first { it.name.equals("Content-Type", ignoreCase = true) }.value.toMediaTypeOrNull()
+                                } else {
+                                    "application/octet-stream".toMediaTypeOrNull()
+                                }
+
+                                val requestBody = byteArray.toRequestBody(mediaType)
+
+                                // val requestBody = byteArray.toRequestBody()
+
+                                val headers = Headers.headersOf(
+                                    *blockRequest.requestHeaders
+                                        .map { listOf(it.name, it.value) }
+                                        .flatten()
+                                        .toTypedArray(),
+                                )
+
+                                val request = Request.Builder()
+                                    .url(httpUrl)
+                                    .put(requestBody)
+                                    .headers(headers)
+                                    .addHeader("Accept", "text/html,*/*;q=0.9")
+                                    .addHeader("accept-encoding", "gzip,identity,*;q=0")
+                                    .addHeader("accept-charset", "ISO-8859-1,utf-8,*;q=0.7")
+                                    .addHeader("user-agent", "Valve/Steam HTTP Client 1.0")
+                                    .build()
+
+                                val httpClient = steamInstance.steamClient!!.configuration.httpClient
+
+                                Timber.i("Sending request to ${request.url} using\n$request")
+
+                                withTimeout(SteamService.requestTimeout) {
+                                    val response = httpClient.newCall(request).execute()
+
+                                    if (!response.isSuccessful) {
+                                        Timber.w(
+                                            "Failed to upload part of %s: HTTP %d %s, %s",
+                                            file.prefixPath,
+                                            response.code,
+                                            response.message,
+                                            response?.body.toString(),
+                                        )
+
+                                        uploadFileSuccess = false
+                                        uploadBatchSuccess = false
+                                    } else {
+                                        // Update progress after successful block upload
+                                        bytesUploadedForFile += blockRequest.blockLength
+                                        if (fileSize > 0) {
+                                            val currentProgress = (bytesUploadedForFile.toFloat() / fileSize).coerceIn(0f, 1f)
+                                            // Only update if progress changed by at least 1% or we're at 100%
+                                            if (currentProgress - lastReportedProgress >= progressThreshold || currentProgress >= 1f) {
+                                                onProgress?.invoke("Uploading ${file.filename}", currentProgress)
+                                                lastReportedProgress = currentProgress
+                                            }
                                         }
                                     }
                                 }
                             }
                         }
+
+                        val commitSuccess = steamCloud.commitFileUpload(
+                            transferSucceeded = uploadFileSuccess,
+                            appId = appInfo.id,
+                            fileSha = file.sha,
+                            filename = if (appInfo.ufs.saveFilePatterns.isEmpty()) {
+                                // For SteamUserData files, use just the filename without folder prefix
+                                if (file.root == PathType.SteamUserData) {
+                                    file.filename
+                                } else {
+                                    file.path + file.filename
+                                }
+                            } else {
+                                // For SteamUserData files, use just the filename to avoid folder prefix
+                                if (file.root == PathType.SteamUserData) {
+                                    file.filename
+                                } else {
+                                    file.prefixPath
+                                }
+                            },
+                        ).await()
+
+                        Timber.i("File ${file.prefixPath} commit success: $commitSuccess")
+
+                        if (!commitSuccess) {
+                            uploadBatchSuccess = false
+                        } else if (uploadFileSuccess) {
+                            filesUploaded++
+                            bytesUploaded += fileSize
+                        }
                     }
+                } catch (e: Exception) {
+                    // The batch stays open on the server until it is completed, so mark it failed
+                    // and let the finally block close it before this unwinds.
+                    uploadBatchSuccess = false
 
-                    val commitSuccess = steamCloud.commitFileUpload(
-                        transferSucceeded = uploadFileSuccess,
-                        appId = appInfo.id,
-                        fileSha = file.sha,
-                        filename = if (appInfo.ufs.saveFilePatterns.isEmpty()) {
-                            // For SteamUserData files, use just the filename without folder prefix
-                            if (file.root == PathType.SteamUserData) {
-                                file.filename
-                            } else {
-                                file.path + file.filename
-                            }
-                        } else {
-                            // For SteamUserData files, use just the filename to avoid folder prefix
-                            if (file.root == PathType.SteamUserData) {
-                                file.filename
-                            } else {
-                                file.prefixPath
-                            }
-                        },
-                    ).await()
+                    throw e
+                } finally {
+                    // Cancellation must not skip the close, or the batch is left open.
+                    withContext(NonCancellable) {
+                        val batchEResult = if (uploadBatchSuccess) EResult.OK else EResult.Fail
 
-                    Timber.i("File ${file.prefixPath} commit success: $commitSuccess")
+                        Timber.i("Completing upload batch ${uploadBatchResponse.batchID} of ${appInfo.id} with $batchEResult")
 
-                    if (!commitSuccess) {
-                        uploadBatchSuccess = false
-                    } else if (uploadFileSuccess) {
-                        filesUploaded++
-                        bytesUploaded += fileSize
+                        steamCloud.completeAppUploadBatch(
+                            appId = appInfo.id,
+                            batchId = uploadBatchResponse.batchID,
+                            batchEResult = batchEResult,
+                        ).await()
                     }
                 }
-
-                steamCloud.completeAppUploadBatch(
-                    appId = appInfo.id,
-                    batchId = uploadBatchResponse.batchID,
-                    batchEResult = if (uploadBatchSuccess) EResult.OK else EResult.Fail,
-                ).await()
 
                 if (totalFiles > 0) {
                     onProgress?.invoke("Upload complete", 1.0f)
