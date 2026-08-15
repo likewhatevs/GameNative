@@ -54,10 +54,19 @@ object SteamSaveTransfer {
     private data class SaveRoot(
         val rootId: String,
         val path: String,
+        /**
+         * The rule's root type and the directory it named, recorded so an archive can still be
+         * placed inside the importing container when [rootId] no longer matches any rule. Absent
+         * from archives written before these fields existed.
+         */
+        val rootType: String? = null,
+        val relativePath: String? = null,
     )
 
     private data class ResolvedSaveRoot(
         val rootId: String,
+        val rootType: PathType,
+        val relativePath: String,
         val absolutePath: Path,
         val files: List<Path>,
     )
@@ -82,7 +91,14 @@ object SteamSaveTransfer {
             withContext(Dispatchers.IO) {
                 context.contentResolver.openOutputStream(uri)?.use { outputStream ->
                     ZipOutputStream(outputStream.buffered()).use { zip ->
-                        val manifestRoots = roots.map { SaveRoot(rootId = it.rootId, path = it.absolutePath.pathString) }
+                        val manifestRoots = roots.map {
+                            SaveRoot(
+                                rootId = it.rootId,
+                                path = it.absolutePath.pathString,
+                                rootType = it.rootType.name,
+                                relativePath = it.relativePath,
+                            )
+                        }
                         val manifest = SaveArchiveManifest(
                             steamAppId = steamAppId,
                             gameName = app.name,
@@ -189,7 +205,9 @@ object SteamSaveTransfer {
         app: app.gamenative.data.SteamApp,
         prefixToPath: (String) -> String?,
     ): List<ResolvedSaveRoot> {
-        val result = mutableListOf<ResolvedSaveRoot>()
+        // Keyed by root id: several rules can name one directory with different masks, and a file
+        // both masks match may only be archived once.
+        val result = LinkedHashMap<String, ResolvedSaveRoot>()
 
         // 1) UFS patterns (skip SteamUserData — handled below)
         val savePatterns = app.ufs.saveFilePatterns.filter { it.root.isWindows }
@@ -199,13 +217,17 @@ object SteamSaveTransfer {
                 val rootPath = prefixToPath(pattern.root.name) ?: return@forEach
                 val basePath = Paths.get(rootPath, pattern.substitutedPath)
                 val files = findPatternFiles(basePath, pattern)
-                if (files.isNotEmpty()) {
-                    result += ResolvedSaveRoot(
-                        rootId = patternRootId(pattern),
+                if (files.isEmpty()) return@forEach
+                val rootId = patternRootId(pattern)
+                val existing = result[rootId]
+                result[rootId] = existing?.copy(files = (existing.files + files).distinct())
+                    ?: ResolvedSaveRoot(
+                        rootId = rootId,
+                        rootType = pattern.root,
+                        relativePath = pattern.substitutedPath,
                         absolutePath = basePath,
                         files = files,
                     )
-                }
             }
 
         // 2) SteamUserData — always scanned recursively (matches SteamAutoCloud behavior)
@@ -216,15 +238,18 @@ object SteamSaveTransfer {
                 SaveFilePattern(root = PathType.SteamUserData, path = "", pattern = "*", recursive = 1),
             )
             if (userDataFiles.isNotEmpty()) {
-                result += ResolvedSaveRoot(
-                    rootId = PathType.SteamUserData.name.lowercase(),
+                val rootId = PathType.SteamUserData.name.lowercase()
+                result[rootId] = ResolvedSaveRoot(
+                    rootId = rootId,
+                    rootType = PathType.SteamUserData,
+                    relativePath = "",
                     absolutePath = userDataPath,
                     files = userDataFiles,
                 )
             }
         }
 
-        return result
+        return result.values.toList()
     }
 
     /**
@@ -253,10 +278,19 @@ object SteamSaveTransfer {
             knownRoots[PathType.SteamUserData.name.lowercase()] = Paths.get(userDataRoot)
         }
 
-        // Resolve manifest roots against known roots, fall back to stored path
+        // Resolve manifest roots against known roots. A root id folds in the rule's own path, so a
+        // changed ufs rule leaves the archive's id unmatched: rebuild the directory under this
+        // container from the recorded root type before falling back to the exporting device's
+        // absolute path, which need not exist here at all.
         return manifestRoots.associate { mr ->
-            mr.rootId to (knownRoots[mr.rootId] ?: Paths.get(mr.path))
+            mr.rootId to (knownRoots[mr.rootId] ?: rerootedPath(mr, prefixToPath) ?: Paths.get(mr.path))
         }
+    }
+
+    private fun rerootedPath(root: SaveRoot, prefixToPath: (String) -> String?): Path? {
+        val rootType = root.rootType?.let(PathType::from)?.takeIf { it != PathType.None } ?: return null
+        val basePath = prefixToPath(rootType.name) ?: return null
+        return Paths.get(basePath, root.relativePath.orEmpty())
     }
 
     internal fun findPatternFiles(basePath: Path, pattern: SaveFilePattern): List<Path> {
@@ -310,15 +344,18 @@ object SteamSaveTransfer {
         rootMap: Map<String, Path>,
     ): Boolean {
         val relativeEntry = entryName.removePrefix(FILES_PREFIX).replace('\\', '/')
-        val slashIndex = relativeEntry.indexOf('/')
-        if (slashIndex <= 0) return false
 
-        val rootId = relativeEntry.substring(0, slashIndex)
-        val relativePath = normalizeRelativePath(relativeEntry.substring(slashIndex + 1))
+        // A ufs rule's root id folds in the rule's own path, so it carries separators of its own
+        // and cannot be read off as the entry's first path component. Match the ids the manifest
+        // declared instead, longest first, so an id nested inside another resolves to its own root.
+        val rootId = rootMap.keys
+            .filter { relativeEntry.startsWith("$it/") }
+            .maxByOrNull { it.length }
+            ?: throw IOException("Archive save root not available for entry: $entryName")
+        val relativePath = normalizeRelativePath(relativeEntry.substring(rootId.length + 1))
         if (relativePath.isBlank()) return false
 
-        val destinationRoot = rootMap[rootId]
-            ?: throw IOException("Archive save root not available: $rootId")
+        val destinationRoot = rootMap.getValue(rootId)
         val normalizedRoot = destinationRoot.normalize()
         val destination = normalizedRoot.resolve(relativePath).normalize()
         if (!destination.startsWith(normalizedRoot)) {
