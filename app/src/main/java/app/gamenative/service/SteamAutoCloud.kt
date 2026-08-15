@@ -75,6 +75,15 @@ object SteamAutoCloud {
 
     private const val MAX_USER_FILE_RETRIES = 3
 
+    /**
+     * Empty reads tolerated in a row before a stream counts as stuck.
+     *
+     * A blocking read only returns 0 for a zero-length request, so any empty read already means the
+     * stream is misbehaving; the allowance is there for one that returns a short burst of them
+     * before its data arrives.
+     */
+    internal const val MAX_CONSECUTIVE_EMPTY_READS = 64
+
     internal data class HashLookupResult(
         val sha: ByteArray,
         val wasCacheHit: Boolean,
@@ -96,7 +105,7 @@ object SteamAutoCloud {
     private fun findPlaceholderWithin(aString: String): Sequence<MatchResult> =
         Regex("%\\w+%").findAll(aString)
 
-    private inline fun InputStream.copyTo(
+    internal inline fun InputStream.copyTo(
         out: OutputStream,
         bufferSize: Int = 8 * 1024,
         progress: (chunkBytes: Long, totalBytes: Long) -> Unit,
@@ -104,8 +113,18 @@ object SteamAutoCloud {
         val buf = ByteArray(bufferSize)
         var bytesRead: Int
         var total = 0L
+        var emptyReads = 0
         while (read(buf).also { bytesRead = it } >= 0) {
-            if (bytesRead == 0) continue
+            if (bytesRead == 0) {
+                // Skipping the empty read keeps a zero-length chunk out of the output and out of
+                // the progress callback, but a stream that only ever returns 0 would spin here
+                // forever: the loop never suspends, so the caller's withTimeout cannot cancel it.
+                if (++emptyReads > MAX_CONSECUTIVE_EMPTY_READS) {
+                    throw IOException("Stream returned $emptyReads empty reads in a row after $total byte(s)")
+                }
+                continue
+            }
+            emptyReads = 0
             out.write(buf, 0, bytesRead)
             total += bytesRead
             progress(bytesRead.toLong(), total)
