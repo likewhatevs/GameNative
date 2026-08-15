@@ -155,6 +155,11 @@ object SteamCloudCleanup {
 
         SteamAutoCloud.closeAbandonedUploadBatch(steamCloud, appInfo.id)
 
+        // Must precede the deletes. Steam accepts a delete batch while another client holds an
+        // upload pending for the app, and reports it complete, but does not apply it - the files
+        // are still listed by the next scan. Retire the stale flag first so these deletes land.
+        clearPendingRemoteOperations(appInfo, clientId, steamInstance, steamCloud)
+
         val batchKey = SteamAutoCloud.openUploadBatchKey(appInfo.id)
         val appBuildId = appInfo.branches[SteamService.getInstalledApp(appInfo.id)?.branch ?: "public"]?.buildId ?: 0
         val failedPaths = mutableListOf<String>()
