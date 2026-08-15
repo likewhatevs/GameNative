@@ -17,8 +17,8 @@ import app.gamenative.enums.SyncResult
 import app.gamenative.service.SteamService.Companion.FileChanges
 import app.gamenative.service.SteamService.Companion.getAppDirPath
 import app.gamenative.utils.CURRENT_UFS_PARSE_VERSION
-import app.gamenative.utils.FileUtils
 import app.gamenative.utils.Net
+import app.gamenative.utils.SteamSaveSweep
 import app.gamenative.utils.SteamUtils
 import `in`.dragonbra.javasteam.enums.EOSType
 import `in`.dragonbra.javasteam.enums.EResult
@@ -37,7 +37,6 @@ import java.nio.file.Path
 import java.nio.file.Paths
 import java.util.Date
 import java.util.concurrent.atomic.AtomicInteger
-import java.util.stream.Collectors
 import java.util.zip.ZipInputStream
 import kotlin.io.path.name
 import kotlin.io.path.pathString
@@ -358,13 +357,21 @@ object SteamAutoCloud {
 
                     val basePath = Paths.get(prefixToPath(userFile.root.toString()), userFile.substitutedPath)
 
-                    Timber.i("Looking for saves in $basePath with pattern ${userFile.pattern} (prefix ${userFile.prefix})")
+                    // `recursive` is a boolean in the ufs schema and is absent far more often than
+                    // not; descending anyway sweeps up whatever the engine keeps in subdirectories
+                    // of the save directory.
+                    val recursive = userFile.recursive != 0
 
-                    val filePaths = FileUtils.findFilesRecursive(
-                        rootPath = basePath,
+                    Timber.i(
+                        "Looking for saves in $basePath with pattern ${userFile.pattern} " +
+                            "(prefix ${userFile.prefix}, recursive=$recursive)",
+                    )
+
+                    val filePaths = SteamSaveSweep.findSaveFiles(
+                        basePath = basePath,
                         pattern = userFile.pattern,
-                        maxDepth = 5,
-                    ).collect(Collectors.toList())
+                        recursive = recursive,
+                    )
                     val files = buildList {
                         for (path in filePaths) {
                             val hashLookup = getCachedShaOrHash(
@@ -408,11 +415,11 @@ object SteamAutoCloud {
 
             Timber.i("Scanning $basePath recursively (depth 5) under ${rootType.name}")
 
-            val steamUserDataPaths = FileUtils.findFilesRecursive(
-                rootPath = basePath,
+            val steamUserDataPaths = SteamSaveSweep.findSaveFiles(
+                basePath = basePath,
                 pattern = "*",
-                maxDepth = 5,
-            ).collect(Collectors.toList())
+                recursive = true,
+            )
             val files = buildList {
                 for (path in steamUserDataPaths) {
                     val hashLookup = getCachedShaOrHash(

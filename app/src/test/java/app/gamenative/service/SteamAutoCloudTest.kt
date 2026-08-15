@@ -137,22 +137,26 @@ class SteamAutoCloudTest {
             .allowMainThreadQueries()
             .build()
 
-        // Create test SteamApp with 3 patterns sharing the same prefix
+        // Create test SteamApp with 3 patterns sharing the same prefix. The save files sit in a
+        // SaveGames subdirectory of the declared path, which only a recursive rule reaches.
         val saveFilePatterns = listOf(
             SaveFilePattern(
                 root = PathType.WinMyDocuments,
                 path = "My Games/TestGame/Steam/76561198025127569",
                 pattern = "Capture*.sav",
+                recursive = 1,
             ),
             SaveFilePattern(
                 root = PathType.WinMyDocuments,
                 path = "My Games/TestGame/Steam/76561198025127569",
                 pattern = "*SaveData*.sav",
+                recursive = 1,
             ),
             SaveFilePattern(
                 root = PathType.WinMyDocuments,
                 path = "My Games\\TestGame\\Steam\\76561198025127569",
                 pattern = "SystemData_0.sav",
+                recursive = 1,
             ),
         )
 
@@ -918,12 +922,14 @@ class SteamAutoCloudTest {
         subdir7.mkdirs()
         File(subdir7, "level7.sav").writeBytes("level7".toByteArray())
 
-        // Update test app with pattern that matches all .sav files
+        // Update test app with a recursive pattern that matches all .sav files. Only a rule with
+        // recursive set descends at all; the depth cap below is what bounds that descent.
         val saveFilePatterns = listOf(
             SaveFilePattern(
                 root = PathType.WinMyDocuments,
                 path = "My Games/TestGame/Steam/76561198025127569",
                 pattern = "*.sav",
+                recursive = 1,
             ),
         )
 
@@ -989,9 +995,9 @@ class SteamAutoCloudTest {
         ).await()
 
         // Verify result - should find files at depths 0-4 (5 files); depth 5 (subdir5) is
-        // the last directory walked but maxDepth=5 does not recurse into its subdirectories.
+        // the last directory walked but the depth cap does not recurse into its subdirectories.
         assertNotNull("Result should not be null", result)
-        assertEquals("Should upload 5 files (depths 0-4, maxDepth=5)", 5, result!!.filesUploaded)
+        assertEquals("Should upload 5 files (depths 0-4, depth cap 5)", 5, result!!.filesUploaded)
         assertTrue("Uploads should be completed", result.uploadsCompleted)
         assertEquals("Should have 5 files managed", 5, result.filesManaged)
 
@@ -2038,7 +2044,11 @@ class SteamAutoCloudTest {
             val basePath = java.nio.file.Paths.get(prefixToPath(pattern.root.toString()), pattern.substitutedPath)
             if (!java.nio.file.Files.exists(basePath)) return@forEach
 
-            app.gamenative.utils.FileUtils.findFilesRecursive(basePath, pattern.pattern, 5).forEach { filePath ->
+            app.gamenative.utils.SteamSaveSweep.findSaveFiles(
+                basePath,
+                pattern.pattern,
+                pattern.recursive != 0,
+            ).forEach { filePath ->
                 val relativePath = basePath.relativize(filePath).toString()
                 cachedFiles.add(
                     app.gamenative.data.UserFileInfo(
@@ -3201,6 +3211,82 @@ class SteamAutoCloudTest {
         assertTrue(
             "cloud-only file must land on disk",
             File(saveFilesDir, "CloudOnlySaveData.sav").exists(),
+        )
+    }
+
+    /**
+     * Replaces the local files with Dome Keeper's layout: a Godot game whose three ufs rules are
+     * all non-recursive with pattern "*.*", while Godot writes its caches and logs into
+     * subdirectories of the very same directory.
+     *
+     * Also puts a stale, non-empty cache in the db so the sync takes the upload path.
+     */
+    private fun installDomeKeeperLayout(pattern: SaveFilePattern) = runBlocking {
+        saveFilesDir.listFiles()?.forEach { it.deleteRecursively() }
+
+        File(saveFilesDir, "savegame_0.json").writeText("save")
+        File(saveFilesDir, "options.txt").writeText("options")
+        File(saveFilesDir, "singleplayer").mkdirs()
+        File(saveFilesDir, "singleplayer/savegame_1.json").writeText("save")
+        File(saveFilesDir, "shader_cache/CanvasOcclusion/9f2c").mkdirs()
+        File(saveFilesDir, "shader_cache/CanvasOcclusion/9f2c/1a4b.vulkan.cache").writeText("shader")
+        File(saveFilesDir, "vulkan").mkdirs()
+        File(saveFilesDir, "vulkan/pipelines.forward_plus.adreno.cache").writeText("pipelines")
+        File(saveFilesDir, "logs").mkdirs()
+        File(saveFilesDir, "logs/godot.log").writeText("log")
+
+        val testApp = db.steamAppDao().findApp(steamAppId)!!
+        db.steamAppDao().update(
+            testApp.copy(ufs = UFS(saveFilePatterns = listOf(pattern))),
+        )
+
+        db.appChangeNumbersDao().deleteByAppId(steamAppId)
+        db.appFileChangeListsDao().deleteByAppId(steamAppId)
+        db.appChangeNumbersDao().insert(app.gamenative.data.ChangeNumbers(steamAppId, 0))
+        db.appFileChangeListsDao().insert(
+            steamAppId,
+            listOf(
+                app.gamenative.data.UserFileInfo(
+                    root = PathType.WinMyDocuments,
+                    path = "__stale__",
+                    filename = "__placeholder__",
+                    timestamp = 0L,
+                    sha = ByteArray(20) { 0 },
+                ),
+            ),
+        )
+    }
+
+    private val domeKeeperPattern = SaveFilePattern(
+        root = PathType.WinMyDocuments,
+        path = "My Games/TestGame/Steam/76561198025127569/SaveGames",
+        pattern = "*.*",
+    )
+
+    // ── Root cause: a non-recursive rule must not reach the engine's caches ──
+    @Test
+    fun nonRecursiveRule_doesNotSweepGodotCaches() = runBlocking {
+        installDomeKeeperLayout(domeKeeperPattern)
+
+        val result = SteamAutoCloud.syncUserFiles(
+            appInfo = db.steamAppDao().findApp(steamAppId)!!,
+            clientId = clientId,
+            steamInstance = mockSteamService,
+            steamCloud = mockSteamCloud,
+            preferredSave = SaveLocation.None,
+            prefixToPath = makePrefixToPath(),
+        ).await()
+
+        assertNotNull(result)
+        assertEquals(
+            "a rule without recursive covers only its own directory",
+            2,
+            result!!.filesManaged,
+        )
+        assertEquals("only the two real saves upload", 2, result.filesUploaded)
+        assertTrue(
+            "the shader cache stays on disk, it is just not synced",
+            File(saveFilesDir, "shader_cache/CanvasOcclusion/9f2c/1a4b.vulkan.cache").exists(),
         )
     }
 
