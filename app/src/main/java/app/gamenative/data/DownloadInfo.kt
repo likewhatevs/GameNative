@@ -26,6 +26,12 @@ data class DownloadInfo(
     private var bytesDownloaded: Long = 0L
     private var persistencePath: String? = null
 
+    // Throttle state for the progress snapshot file (see persistProgressSnapshot).
+    private var timeSourceMs: () -> Long = { System.currentTimeMillis() }
+    private var lastPersistAtMs: Long = 0L
+    private var lastPersistedBytes: Long = 0L
+    private var hasPersisted: Boolean = false
+
     private data class SpeedSample(val timeMs: Long, val bytes: Long)
 
     private val speedSamples = CopyOnWriteArrayList<SpeedSample>()
@@ -45,7 +51,8 @@ data class DownloadInfo(
 
     fun cancel(message: String) {
         // Persist the most recent progress so a resume can pick up where it left off.
-        persistProgressSnapshot()
+        // Terminal path: bypass the throttle so the final count reaches disk.
+        persistProgressSnapshot(force = true)
         // Mark as inactive and clear speed tracking so a future resume
         // does not use stale samples.
         setActive(false)
@@ -109,8 +116,35 @@ data class DownloadInfo(
         persistencePath = appDirPath
     }
 
-    fun persistProgressSnapshot() {
-        persistencePath?.let { persistBytesDownloaded(it) }
+    /**
+     * Write the current byte count to the app directory, at most once per
+     * [PERSIST_MIN_INTERVAL_MS] and at least once per [PERSIST_MIN_BYTE_DELTA] of new data.
+     *
+     * Callers on the hot per-chunk path use the default; terminal paths (cancel, failure,
+     * depot completion, service teardown) must pass [force] so the final count reaches disk.
+     *
+     * Synchronized because depot chunks complete on several downloader threads at once: the
+     * throttle bookkeeping has to be consistent, and two threads must not rewrite the file
+     * at the same time.
+     */
+    @Synchronized
+    fun persistProgressSnapshot(force: Boolean = false) {
+        val path = persistencePath ?: return
+        val now = timeSourceMs()
+        val throttled = hasPersisted &&
+            now - lastPersistAtMs < PERSIST_MIN_INTERVAL_MS &&
+            bytesDownloaded - lastPersistedBytes < PERSIST_MIN_BYTE_DELTA
+        if (!force && throttled) {
+            return
+        }
+        hasPersisted = true
+        lastPersistAtMs = now
+        lastPersistedBytes = bytesDownloaded
+        persistBytesDownloaded(path)
+    }
+
+    internal fun setTimeSource(source: () -> Long) {
+        timeSourceMs = source
     }
 
     fun updateBytesDownloaded(
@@ -269,6 +303,15 @@ data class DownloadInfo(
     companion object {
         private const val PERSISTENCE_DIR = ".DownloadInfo"
         private const val PERSISTENCE_FILE = "bytes_downloaded.txt"
+
+        // The snapshot holds a single integer that is only used to seed the progress bar and
+        // ETA on resume — the downloader itself re-validates file chunks against the manifest —
+        // so losing a few seconds of it costs nothing but a briefly low percentage. Writing it
+        // per chunk, on the other hand, rewrites the file tens of thousands of times over a
+        // large install, and inside the game directory that lands on the install volume, which
+        // for an SD card is slow, FUSE-backed storage shared with every other file operation.
+        private const val PERSIST_MIN_INTERVAL_MS = 2_000L
+        private const val PERSIST_MIN_BYTE_DELTA = 64L * 1024 * 1024
     }
 
     /**
