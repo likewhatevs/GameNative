@@ -26,6 +26,7 @@ enum class AppOptionMenuType(@StringRes val title: Int) {
     MoveToInternalStorage(R.string.option_move_to_internal_storage),
     ForceCloudSync(R.string.option_force_cloud_sync),
     BrowseOnlineSaves(R.string.option_browse_online_saves),
+    CleanCloudCache(R.string.option_clean_cloud_cache),
     ForceDownloadRemote(R.string.option_force_download_remote),
     ForceUploadLocal(R.string.option_force_upload_local),
     FetchSteamGridDBImages(R.string.option_fetch_game_images),

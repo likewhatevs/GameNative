@@ -2777,6 +2777,73 @@ class SteamService : Service(), IChallengeUrlChanged {
             }
         }
 
+        /**
+         * Lists the app's cloud files and sorts them into what a cleanup may remove and what it
+         * must not. Nothing is deleted here; the caller confirms and then calls [cleanCloudFiles].
+         */
+        suspend fun scanCloudForCleanup(appId: Int): SteamCloudCleanup.ScanResult = withContext(Dispatchers.IO) {
+            if (!isConnected) {
+                return@withContext SteamCloudCleanup.ScanResult.Failed("Not connected to Steam")
+            }
+
+            if (!tryAcquireSync(appId)) {
+                Timber.w("Cannot scan cloud files when sync already in progress for appId=$appId")
+                return@withContext SteamCloudCleanup.ScanResult.Failed("A sync is already running for this game")
+            }
+
+            try {
+                val appInfo = getAppInfoOf(appId)
+                    ?: return@withContext SteamCloudCleanup.ScanResult.Failed("No app info for this game")
+                val steamCloud = instance?._steamCloud
+                    ?: return@withContext SteamCloudCleanup.ScanResult.Failed("Steam cloud is unavailable")
+
+                SteamCloudCleanup.scan(appInfo, steamCloud)
+            } finally {
+                releaseSync(appId)
+            }
+        }
+
+        /**
+         * Deletes exactly [paths] from the app's cloud storage.
+         *
+         * The local file-list cache and change number are deliberately left alone: this device's
+         * files have not changed, and recording a change number for a batch we did not diff
+         * against would leave the cache claiming to describe a cloud that has moved on. Leaving
+         * both behind the cloud makes the next sync fetch the current list and rebuild them.
+         */
+        suspend fun cleanCloudFiles(
+            appId: Int,
+            paths: List<String>,
+            onProgress: ((deleted: Int, total: Int) -> Unit)? = null,
+        ): SteamCloudCleanup.CleanupResult? = withContext(Dispatchers.IO) {
+            if (paths.isEmpty() || !isConnected) {
+                return@withContext null
+            }
+
+            if (!tryAcquireSync(appId)) {
+                Timber.w("Cannot clean cloud files when sync already in progress for appId=$appId")
+                return@withContext null
+            }
+
+            try {
+                val clientId = PrefManager.clientId ?: return@withContext null
+                val steamInstance = instance ?: return@withContext null
+                val appInfo = getAppInfoOf(appId) ?: return@withContext null
+                val steamCloud = steamInstance._steamCloud ?: return@withContext null
+
+                SteamCloudCleanup.deleteFiles(
+                    appInfo = appInfo,
+                    clientId = clientId,
+                    steamInstance = steamInstance,
+                    steamCloud = steamCloud,
+                    paths = paths,
+                    onProgress = onProgress,
+                )
+            } finally {
+                releaseSync(appId)
+            }
+        }
+
         suspend fun closeApp(context: Context, appId: Int, isOffline: Boolean, prefixToPath: (String) -> String) = withContext(Dispatchers.IO) {
             async {
                 if (isOffline || !isConnected) {

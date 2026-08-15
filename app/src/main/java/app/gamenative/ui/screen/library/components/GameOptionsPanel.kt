@@ -40,6 +40,7 @@ import androidx.compose.material.icons.filled.ArrowDownward
 import androidx.compose.material.icons.filled.ArrowUpward
 import androidx.compose.material.icons.filled.BugReport
 import androidx.compose.material.icons.filled.Build
+import androidx.compose.material.icons.filled.CleaningServices
 import androidx.compose.material.icons.filled.CloudDownload
 import androidx.compose.material.icons.filled.CloudUpload
 import androidx.compose.material.icons.filled.Delete
@@ -254,7 +255,8 @@ private fun OptionItem(
     val icon = getIconForOption(option.optionType)
     val isDestructive = option.optionType == AppOptionMenuType.Uninstall ||
         option.optionType == AppOptionMenuType.ResetToDefaults ||
-        option.optionType == AppOptionMenuType.ResetDrm
+        option.optionType == AppOptionMenuType.ResetDrm ||
+        option.optionType == AppOptionMenuType.CleanCloudCache
 
     Row(
         modifier = Modifier
@@ -341,6 +343,7 @@ private fun getIconForOption(type: AppOptionMenuType): ImageVector {
         AppOptionMenuType.MoveToInternalStorage -> Icons.Default.Storage
         AppOptionMenuType.ForceCloudSync -> Icons.Default.Sync
         AppOptionMenuType.BrowseOnlineSaves -> Icons.AutoMirrored.Filled.OpenInNew
+        AppOptionMenuType.CleanCloudCache -> Icons.Default.CleaningServices
         AppOptionMenuType.ForceDownloadRemote -> Icons.Default.CloudDownload
         AppOptionMenuType.ForceUploadLocal -> Icons.Default.CloudUpload
         AppOptionMenuType.FetchSteamGridDBImages -> Icons.Default.Image
@@ -401,6 +404,7 @@ private fun groupOptions(options: List<AppMenuOption>): Map<OptionCategory, List
             // Cloud Saves
             AppOptionMenuType.ForceCloudSync,
             AppOptionMenuType.BrowseOnlineSaves,
+            AppOptionMenuType.CleanCloudCache,
             AppOptionMenuType.ForceDownloadRemote,
             AppOptionMenuType.ForceUploadLocal,
             -> cloudSaves.add(option)
