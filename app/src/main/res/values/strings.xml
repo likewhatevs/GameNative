@@ -29,6 +29,17 @@
     <string name="steam_verify_files_title">Verify Files</string>
     <string name="steam_verify_files_message">Please ensure your saves are uploaded to the cloud or backed up before verifying, as they may be overwritten otherwise.</string>
     <string name="steam_cloud_sync_downloading_save_files">Downloading save files %1$d/%2$d</string>
+    <string name="steam_cloud_cleanup_scanning">Checking cloud storage…</string>
+    <string name="steam_cloud_cleanup_deleting">Deleting cloud files %1$d/%2$d</string>
+    <string name="steam_cloud_cleanup_title">Clean cloud cache?</string>
+    <string name="steam_cloud_cleanup_message">%1$d of %2$d cloud files for %3$s are shader caches, logs or other files the game regenerates, taking up %4$s of its Steam Cloud storage. Save files are never deleted.</string>
+    <string name="steam_cloud_cleanup_kept">%1$d other file(s) will be kept, including any save this device does not recognise.</string>
+    <string name="steam_cloud_cleanup_more">…and %1$d more</string>
+    <string name="steam_cloud_cleanup_confirm">Delete %1$d files</string>
+    <string name="steam_cloud_cleanup_nothing">No regenerable cloud files were found for this game</string>
+    <string name="steam_cloud_cleanup_failed">Could not check cloud storage: %1$s</string>
+    <string name="steam_cloud_cleanup_done">Deleted %1$d cloud file(s)</string>
+    <string name="steam_cloud_cleanup_partial">Deleted %1$d of %2$d cloud file(s); the rest could not be removed</string>
     <string name="steam_update_title">Update</string>
     <string name="steam_update_message">Please ensure your saves are uploaded to the cloud or backed up before updating, as they may be overwritten otherwise.</string>
     <string name="steam_not_logged_in">You must be logged into Steam to use this feature</string>
@@ -1639,6 +1650,7 @@
     <string name="option_move_to_internal_storage">Move to internal storage</string>
     <string name="option_force_cloud_sync">Force cloud sync</string>
     <string name="option_browse_online_saves">Browse online saves</string>
+    <string name="option_clean_cloud_cache">Clean cloud cache</string>
     <string name="option_force_download_remote">Force download remote saves</string>
     <string name="option_force_upload_local">Force upload local saves</string>
     <string name="option_fetch_game_images">Fetch game images</string>

@@ -48,6 +48,7 @@ import app.gamenative.enums.PathType
 import app.gamenative.enums.SyncResult
 import app.gamenative.events.AndroidEvent
 import app.gamenative.service.DownloadService
+import app.gamenative.service.SteamCloudCleanup
 import app.gamenative.service.SteamService
 import app.gamenative.service.SteamService.Companion.getAppDirPath
 import app.gamenative.ui.component.dialog.MessageDialog
@@ -733,6 +734,9 @@ class SteamAppScreen : BaseAppScreen() {
                     context.startActivity(browserIntent)
                 },
             ),
+            // Offered whether or not the game is installed: the junk sits in the cloud, and the
+            // device that has to clear it is usually the one that no longer holds the game.
+            getCleanCloudCacheOption(context, libraryItem, appInfo.name),
             AppMenuOption(
                 AppOptionMenuType.ChangeBranch,
                 onClick = {
@@ -863,6 +867,118 @@ class SteamAppScreen : BaseAppScreen() {
         )
 
         return options
+    }
+
+    /**
+     * Offers to delete the regenerable engine files an app has accumulated in Steam Cloud.
+     *
+     * A sync can only delete a cloud file that its local file-list cache still lists, so once that
+     * cache is gone — game uninstalled, app data cleared, container recreated — nothing in the app
+     * can clear such files, and they keep occupying the app's cloud quota. This asks Steam what the
+     * cloud actually holds and offers only the entries the save sweep refuses to upload.
+     */
+    @Composable
+    private fun getCleanCloudCacheOption(context: Context, libraryItem: LibraryItem, appName: String): AppMenuOption {
+        val gameId = libraryItem.gameId
+
+        var scanning by remember(gameId) { mutableStateOf(false) }
+        var deleteProgress by remember(gameId) { mutableStateOf<Pair<Int, Int>?>(null) }
+        var scanResult by remember(gameId) { mutableStateOf<SteamCloudCleanup.ScanResult.Ready?>(null) }
+
+        if (scanning) {
+            LoadingDialog(
+                visible = true,
+                progress = -1f,
+                message = stringResource(R.string.steam_cloud_cleanup_scanning),
+            )
+        }
+
+        deleteProgress?.let { (done, total) ->
+            LoadingDialog(
+                visible = true,
+                progress = -1f,
+                message = stringResource(R.string.steam_cloud_cleanup_deleting, done, total),
+            )
+        }
+
+        scanResult?.let { ready ->
+            CleanCloudCacheDialog(
+                appName = appName,
+                scan = ready,
+                onDismiss = { scanResult = null },
+                onConfirm = {
+                    // Only what the user just saw and confirmed is ever sent.
+                    val paths = ready.removable.map { it.path }
+                    scanResult = null
+                    deleteProgress = 0 to paths.size
+
+                    CoroutineScope(Dispatchers.IO).launch {
+                        try {
+                            val result = SteamService.cleanCloudFiles(
+                                appId = gameId,
+                                paths = paths,
+                                onProgress = { deleted, total -> deleteProgress = deleted to total },
+                            )
+
+                            withContext(Dispatchers.Main) {
+                                when {
+                                    result == null -> SnackbarManager.show(
+                                        context.getString(R.string.library_cloud_sync_failed),
+                                    )
+
+                                    result.failedPaths.isEmpty() -> SnackbarManager.show(
+                                        context.getString(R.string.steam_cloud_cleanup_done, result.deleted),
+                                    )
+
+                                    else -> SnackbarManager.show(
+                                        context.getString(
+                                            R.string.steam_cloud_cleanup_partial,
+                                            result.deleted,
+                                            result.requested,
+                                        ),
+                                    )
+                                }
+                            }
+                        } finally {
+                            withContext(NonCancellable + Dispatchers.Main) {
+                                deleteProgress = null
+                            }
+                        }
+                    }
+                },
+            )
+        }
+
+        return AppMenuOption(
+            optionType = AppOptionMenuType.CleanCloudCache,
+            onClick = {
+                scanning = true
+
+                CoroutineScope(Dispatchers.IO).launch {
+                    try {
+                        when (val result = SteamService.scanCloudForCleanup(gameId)) {
+                            is SteamCloudCleanup.ScanResult.Failed -> withContext(Dispatchers.Main) {
+                                SnackbarManager.show(
+                                    context.getString(R.string.steam_cloud_cleanup_failed, result.reason),
+                                )
+                            }
+
+                            is SteamCloudCleanup.ScanResult.Ready -> withContext(Dispatchers.Main) {
+                                if (result.removable.isEmpty()) {
+                                    SnackbarManager.show(context.getString(R.string.steam_cloud_cleanup_nothing))
+                                } else {
+                                    scanResult = result
+                                }
+                            }
+                        }
+                    } finally {
+                        withContext(NonCancellable + Dispatchers.Main) {
+                            scanning = false
+                        }
+                    }
+                }
+            },
+        )
     }
 
     override fun loadContainerData(context: Context, libraryItem: LibraryItem): ContainerData {
@@ -1537,6 +1653,86 @@ class SteamAppScreen : BaseAppScreen() {
             )
         }
     }
+}
+
+/** Paths listed in full before the rest are summarised, so the dialog stays readable. */
+private const val MAX_CLEANUP_PATHS_SHOWN = 15
+
+/**
+ * Confirms a cloud cleanup, naming the files it would delete.
+ *
+ * Everything the scan did not recognise as regenerable is counted as kept, so a save this device
+ * knows nothing about is visibly out of the deletion rather than silently in it.
+ */
+@Composable
+private fun CleanCloudCacheDialog(
+    appName: String,
+    scan: SteamCloudCleanup.ScanResult.Ready,
+    onConfirm: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    val removable = scan.removable
+    val shown = removable.take(MAX_CLEANUP_PATHS_SHOWN)
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(stringResource(R.string.steam_cloud_cleanup_title)) },
+        text = {
+            Column(modifier = Modifier.fillMaxWidth()) {
+                Text(
+                    text = stringResource(
+                        R.string.steam_cloud_cleanup_message,
+                        removable.size,
+                        scan.files.size,
+                        appName,
+                        StorageUtils.formatBinarySize(removable.sumOf { it.sizeBytes }),
+                    ),
+                )
+
+                Spacer(modifier = Modifier.height(12.dp))
+
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(max = 200.dp)
+                        .verticalScroll(rememberScrollState()),
+                ) {
+                    shown.forEach { file ->
+                        Text(text = file.path, style = MaterialTheme.typography.bodySmall)
+                    }
+
+                    if (removable.size > shown.size) {
+                        Text(
+                            text = stringResource(R.string.steam_cloud_cleanup_more, removable.size - shown.size),
+                            style = MaterialTheme.typography.bodySmall,
+                        )
+                    }
+                }
+
+                if (scan.kept.isNotEmpty()) {
+                    Spacer(modifier = Modifier.height(12.dp))
+
+                    Text(
+                        text = stringResource(R.string.steam_cloud_cleanup_kept, scan.kept.size),
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = onConfirm) {
+                Text(
+                    text = stringResource(R.string.steam_cloud_cleanup_confirm, removable.size),
+                    color = MaterialTheme.colorScheme.error,
+                )
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) {
+                Text(stringResource(R.string.cancel))
+            }
+        },
+    )
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
