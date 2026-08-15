@@ -46,6 +46,9 @@ object DownloadService {
             .flatMap { dir -> listOfNotNull(dir.absolutePath, StorageUtils.publicInstallRoot(dir)?.absolutePath) }
             .distinct()
 
+        // externalVolumePaths and the base dirs feed SteamService.allInstallPaths
+        SteamService.invalidateInstallPathCaches()
+
         migrateExternalStoragePath()
     }
 
@@ -64,6 +67,9 @@ object DownloadService {
     @Synchronized
     fun invalidateCache() {
         lastUpdateTime = 0
+        // callers invalidate here after installing/uninstalling/moving a game, which is
+        // exactly when a cached per-app directory resolution can have gone stale
+        SteamService.invalidateInstallPathCaches()
     }
 
     @Synchronized
