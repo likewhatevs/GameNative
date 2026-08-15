@@ -1153,6 +1153,13 @@ private fun LibraryScreenContent(
                         },
                         onSearchQuery = onSearchQuery,
                         onDismiss = { onIsSearching(false) },
+                        onLeaveField = {
+                            if (isListFocusable()) {
+                                requestContentFocusOrDefer()
+                            } else {
+                                requestRootFocusSafe()
+                            }
+                        },
                         modifier = Modifier
                             .align(Alignment.TopCenter)
                             .fillMaxWidth(),
