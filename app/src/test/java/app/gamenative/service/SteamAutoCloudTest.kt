@@ -58,8 +58,10 @@ import org.mockito.kotlin.doReturn
 import org.mockito.kotlin.mock
 import org.mockito.kotlin.whenever
 import org.robolectric.RobolectricTestRunner
+import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.IOException
+import java.io.InputStream
 import java.lang.reflect.Field
 import java.nio.file.Path
 import java.util.EnumSet
@@ -3405,6 +3407,59 @@ class SteamAutoCloudTest {
             0L,
             PrefManager.getLong(SteamAutoCloud.openUploadBatchKey(steamAppId), 0L),
         )
+    }
+
+    /**
+     * The stream gives up long before the JUnit timeout would, because a copy that spins on empty
+     * reads cannot be interrupted: it would hang the whole suite instead of failing this test.
+     */
+    @Test(timeout = 30_000)
+    fun copyTo_streamStuckOnEmptyReads_failsInsteadOfSpinning() {
+        val readsBeforeGivingUp = SteamAutoCloud.MAX_CONSECUTIVE_EMPTY_READS * 1000
+        var reads = 0
+        val stuckStream = object : InputStream() {
+            override fun read(): Int = throw UnsupportedOperationException()
+            override fun read(b: ByteArray, off: Int, len: Int): Int {
+                if (++reads > readsBeforeGivingUp) {
+                    throw AssertionError("copyTo read an empty stream $reads times without giving up")
+                }
+                return 0
+            }
+        }
+
+        val thrown = runCatching {
+            with(SteamAutoCloud) { stuckStream.copyTo(ByteArrayOutputStream()) { _, _ -> } }
+        }.exceptionOrNull()
+
+        assertTrue("a stuck stream must fail the copy, got $thrown", thrown is IOException)
+    }
+
+    @Test(timeout = 30_000)
+    fun copyTo_streamWithOccasionalEmptyReads_copiesEverything() {
+        val content = "save data that arrives in fits and starts".toByteArray()
+        val emptyReadsBeforeEachByte = SteamAutoCloud.MAX_CONSECUTIVE_EMPTY_READS
+        var offset = 0
+        var pending = emptyReadsBeforeEachByte
+        val stallingStream = object : InputStream() {
+            override fun read(): Int = throw UnsupportedOperationException()
+            override fun read(b: ByteArray, off: Int, len: Int): Int = when {
+                offset == content.size -> -1
+                pending-- > 0 -> 0
+                else -> {
+                    pending = emptyReadsBeforeEachByte
+                    b[off] = content[offset++]
+                    1
+                }
+            }
+        }
+
+        val out = ByteArrayOutputStream()
+        var reportedBytes = 0L
+        val copied = with(SteamAutoCloud) { stallingStream.copyTo(out) { chunk, _ -> reportedBytes += chunk } }
+
+        assertEquals(content.size.toLong(), copied)
+        assertEquals(content.size.toLong(), reportedBytes)
+        assertEquals(content.contentToString(), out.toByteArray().contentToString())
     }
 
     @Test
