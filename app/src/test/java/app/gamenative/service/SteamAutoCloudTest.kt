@@ -3374,6 +3374,21 @@ class SteamAutoCloudTest {
     }
 
     @Test
+    fun failureDuringUpload_stillClosesTheBatch() = runBlocking {
+        val changeNumber = stageLocalChangesForUpload()
+        stubUploadBatch(batchId = 7, appChangeNumber = changeNumber + 1)
+
+        every { mockSteamCloud.beginFileUpload(any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any()) } returns
+            CompletableFuture.failedFuture(IOException("upload service unreachable"))
+
+        val thrown = runCatching { runSync() }.exceptionOrNull()
+
+        assertNotNull("the failure must reach the caller", thrown)
+        verify { mockSteamCloud.completeAppUploadBatch(steamAppId, 7L, EResult.Fail, any()) }
+        assertSyncStateUnchanged(changeNumber)
+    }
+
+    @Test
     fun oversizedCachedFileList_readsAsNoCache() = runBlocking {
         val throwingDao = mock<FileChangeListsDao>()
         whenever(throwingDao.getByAppId(any())).thenThrow(SQLiteBlobTooBigException())
