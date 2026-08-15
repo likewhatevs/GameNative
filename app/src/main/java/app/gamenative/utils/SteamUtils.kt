@@ -5,6 +5,7 @@ import android.content.Context
 import android.provider.Settings
 import app.gamenative.PluviaApp
 import app.gamenative.PrefManager
+import app.gamenative.data.AppInfo
 import app.gamenative.data.DepotInfo
 import app.gamenative.data.LaunchInfo
 import app.gamenative.data.ManifestInfo
@@ -733,7 +734,6 @@ object SteamUtils {
             // Get game directory info
             val gameDir = File(SteamService.getAppDirPath(steamAppId))
             val gameName = gameDir.name
-            val sizeOnDisk = calculateDirectorySize(gameDir)
 
             // Create symlink from Steam common directory to actual game directory
             val steamGameLink = File(commonDir, gameName)
@@ -742,7 +742,8 @@ object SteamUtils {
                 Timber.i("Created symlink from ${steamGameLink.absolutePath} to ${gameDir.absolutePath}")
             }
 
-            val installedBranch = SteamService.getInstalledApp(steamAppId)?.branch ?: "public"
+            val installedApp = SteamService.getInstalledApp(steamAppId)
+            val installedBranch = installedApp?.branch ?: "public"
             val buildId = (appInfo.branches[installedBranch] ?: appInfo.branches["public"])?.buildId ?: 0L
             val downloadableDepots = SteamService.getDownloadableDepots(steamAppId)
 
@@ -750,9 +751,7 @@ object SteamUtils {
             val sharedDepots = mutableMapOf<Int, DepotInfo>()
 
             downloadableDepots.forEach { (depotId, depotInfo) ->
-                val manifest = depotInfo.manifests[installedBranch]
-                    ?: depotInfo.manifests["public"]
-                    ?: depotInfo.manifests.values.firstOrNull()
+                val manifest = resolveManifest(depotInfo, installedBranch)
                 if (manifest != null && manifest.gid != 0L) {
                     regularDepots[depotId] = depotInfo
                 } else {
@@ -762,6 +761,8 @@ object SteamUtils {
 
             // Find the main content depot (owner) - typically the one with the lowest ID that has content
             val mainDepotId = regularDepots.keys.minOrNull()
+
+            val sizeOnDisk = resolveSizeOnDisk(installedApp, installedBranch, regularDepots, gameDir)
 
             // Create ACF content
             val acfContent = buildString {
@@ -791,9 +792,7 @@ object SteamUtils {
                     appendLine("\t\"InstalledDepots\"")
                     appendLine("\t{")
                     regularDepots.forEach { (depotId, depotInfo) ->
-                        val manifest = depotInfo.manifests[installedBranch]
-                            ?: depotInfo.manifests["public"]
-                            ?: depotInfo.manifests.values.firstOrNull()
+                        val manifest = resolveManifest(depotInfo, installedBranch)
                         appendLine("\t\t\"$depotId\"")
                         appendLine("\t\t{")
                         appendLine("\t\t\t\"manifest\"\t\t\"${manifest?.gid ?: "0"}\"")
@@ -847,6 +846,44 @@ object SteamUtils {
     private fun escapeString(input: String?): String {
         if (input == null) return ""
         return input.replace("\"", "\\\"").replace("\n", "\\n").replace("\r", "\\r")
+    }
+
+    /** Manifest for [branch], falling back to public and then to any branch the depot offers. */
+    internal fun resolveManifest(depotInfo: DepotInfo, branch: String): ManifestInfo? =
+        depotInfo.manifests[branch]
+            ?: depotInfo.manifests["public"]
+            ?: depotInfo.manifests.values.firstOrNull()
+
+    /**
+     * Bytes to report as `SizeOnDisk` in the generated ACF.
+     *
+     * The depot manifests already carry the installed content size, so sum the depots the app
+     * actually downloaded — those are the same ones written to `InstalledDepots`, which keeps
+     * the two fields consistent. Walking [gameDir] is the last resort: it is one stat per file
+     * over the whole install, which costs seconds on SD-card (FUSE) storage.
+     */
+    internal fun resolveSizeOnDisk(
+        installedApp: AppInfo?,
+        installedBranch: String,
+        depots: Map<Int, DepotInfo>,
+        gameDir: File,
+    ): Long {
+        val installedDepotIds = installedApp?.downloadedDepots.orEmpty().toSet()
+        val depotSize = depots
+            .filterKeys { it in installedDepotIds }
+            .values
+            .sumOf { resolveManifest(it, installedBranch)?.size ?: 0L }
+        if (depotSize > 0L) {
+            return depotSize
+        }
+
+        val recoveredSize = installedApp?.recoveredInstallSizeBytes ?: 0L
+        if (recoveredSize > 0L) {
+            return recoveredSize
+        }
+
+        Timber.i("No depot size metadata for ${gameDir.name}, falling back to a directory walk")
+        return calculateDirectorySize(gameDir)
     }
 
     private fun calculateDirectorySize(directory: File): Long {
