@@ -2649,6 +2649,17 @@ class SteamService : Service(), IChallengeUrlChanged {
                                                     osType = EOSType.WinUnknown,
                                                 ).await()
 
+                                                if (pendingRemoteOperations.isNotEmpty()) {
+                                                    Timber.w(
+                                                        "App %d has pending remote operations: %s",
+                                                        appId,
+                                                        pendingRemoteOperations.joinToString {
+                                                            "${it.operation} on ${it.machineName} " +
+                                                                "(client ${it.clientId}, updated ${it.timeLastUpdated})"
+                                                        },
+                                                    )
+                                                }
+
                                                 if (pendingRemoteOperations.isNotEmpty() && !ignorePendingOperations) {
                                                     syncResult = PostSyncInfo(
                                                         syncResult = SyncResult.PendingOperations,
@@ -2786,7 +2797,7 @@ class SteamService : Service(), IChallengeUrlChanged {
                                                 appId = appId,
                                                 clientId = clientId,
                                                 uploadsCompleted = postSyncInfo?.uploadsCompleted == true,
-                                                uploadsRequired = postSyncInfo?.uploadsRequired == false,
+                                                uploadsRequired = postSyncInfo?.uploadsRequired == true,
                                             )
                                         }
                                     }
