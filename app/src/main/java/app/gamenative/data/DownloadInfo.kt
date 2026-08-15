@@ -5,7 +5,6 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -13,8 +12,6 @@ import kotlinx.coroutines.flow.StateFlow
 import timber.log.Timber
 import java.io.File
 import java.util.concurrent.CopyOnWriteArrayList
-import java.util.concurrent.atomic.AtomicInteger
-import java.util.concurrent.atomic.AtomicLong
 import kotlin.concurrent.Volatile
 
 data class DownloadInfo(
@@ -27,11 +24,6 @@ data class DownloadInfo(
     private val downloadProgressListeners = CopyOnWriteArrayList<(Float) -> Unit>()
     private val progresses: Array<Float> = Array(jobCount) { 0f }
 
-    // Reservation-based persistence scheduler
-    private val nextWriteTime = AtomicLong(0L)
-    private var persistenceJob: Job? = null
-    private val persistenceGeneration = AtomicInteger(0)
-
     private val weights    = FloatArray(jobCount) { 1f }     // ⇐ new
     private var weightSum  = jobCount.toFloat()
 
@@ -39,6 +31,13 @@ data class DownloadInfo(
     private var totalExpectedBytes: Long = 0L
     private var bytesDownloaded: Long = 0L
     private var persistencePath: String? = null
+
+    // Throttle state for the progress snapshot file (see persistProgressSnapshot).
+    private var timeSourceMs: () -> Long = { System.currentTimeMillis() }
+    private var lastPersistAtMs: Long = 0L
+    private var lastPersistedBytes: Long = 0L
+    private var hasPersisted: Boolean = false
+    private var persistenceGeneration: Long = 0L
 
     private data class SpeedSample(val timeMs: Long, val bytes: Long)
 
@@ -50,29 +49,27 @@ data class DownloadInfo(
     private var currentStatusMessage: String = ""
     private val postInstallSyncing = MutableStateFlow(false)
 
-    fun cancel() {
-        cancel("Cancelled by user")
-    }
+    fun cancel(): Job = cancel("Cancelled by user")
 
-    fun failedToDownload() {
-        cancel("Failed to download")
-    }
+    fun failedToDownload(): Job = cancel("Failed to download")
 
-    fun cancel(message: String) {
+    fun cancel(message: String): Job {
         // Mark as inactive and clear speed tracking so a future resume
         // does not use stale samples.
         setActive(false)
         setPostInstallSyncing(false)
         resetSpeedTracking()
+        val generation = synchronized(this) { persistenceGeneration }
         // The snapshot write hits the (possibly saturated) install volume and the
         // job cancel cascades through many continuations; callers include UI click
         // handlers on the main thread, so both must run off it (ANR otherwise).
-        ioScope.launch {
+        return ioScope.launch {
             // Signal cancellation before the possibly-slow snapshot write, so a
             // restarted download for the same path can't overlap the dying job.
             downloadJob?.cancel(CancellationException(message))
-            // Persist the most recent progress so a resume can pick up where it left off.
-            persistProgressSnapshot()
+            // Terminal path: bypass the throttle, but only if completion has not already
+            // cleared the resume file while this asynchronous cancellation was queued.
+            persistCancellationSnapshot(generation)
         }
     }
 
@@ -131,8 +128,49 @@ data class DownloadInfo(
         persistencePath = appDirPath
     }
 
-    fun persistProgressSnapshot() {
-        persistencePath?.let { persistBytesDownloaded(it) }
+    /**
+     * Write the current byte count to the app directory, at most once per
+     * [PERSIST_MIN_INTERVAL_MS] and at least once per [PERSIST_MIN_BYTE_DELTA] of new data.
+     *
+     * Callers on the hot per-chunk path use the default; terminal paths (cancel, failure,
+     * depot completion, service teardown) must pass [force] so the final count reaches disk.
+     *
+     * Synchronized because depot chunks complete on several downloader threads at once: the
+     * throttle bookkeeping has to be consistent, and two threads must not rewrite the file
+     * at the same time.
+     */
+    @Synchronized
+    fun persistProgressSnapshot(force: Boolean = false) {
+        val path = persistencePath ?: return
+        val now = timeSourceMs()
+        val throttled = hasPersisted &&
+            now - lastPersistAtMs < PERSIST_MIN_INTERVAL_MS &&
+            bytesDownloaded - lastPersistedBytes < PERSIST_MIN_BYTE_DELTA
+        if (!force && throttled) {
+            return
+        }
+        hasPersisted = true
+        lastPersistAtMs = now
+        lastPersistedBytes = bytesDownloaded
+        persistBytesDownloaded(path)
+    }
+
+    /**
+     * Writes the terminal cancel snapshot without allowing a late coroutine to recreate the
+     * resume file after successful completion cleared it.
+     *
+     * This shares this instance's monitor with [clearPersistedBytesDownloaded]: either this
+     * write finishes first and clear removes it, or clear advances the generation and this
+     * write is skipped.
+     */
+    @Synchronized
+    private fun persistCancellationSnapshot(expectedGeneration: Long) {
+        if (expectedGeneration != persistenceGeneration) return
+        persistProgressSnapshot(force = true)
+    }
+
+    internal fun setTimeSource(source: () -> Long) {
+        timeSourceMs = source
     }
 
     fun updateBytesDownloaded(
@@ -292,49 +330,21 @@ data class DownloadInfo(
     companion object {
         private const val PERSISTENCE_DIR = ".DownloadInfo"
         private const val PERSISTENCE_FILE = "bytes_downloaded.txt"
-        private const val PERSIST_DEBOUNCE_MS = 10_000L // 10 seconds
+
+        // The snapshot holds a single integer that is only used to seed the progress bar and
+        // ETA on resume — the downloader itself re-validates file chunks against the manifest —
+        // so losing a few seconds of it costs nothing but a briefly low percentage. Writing it
+        // per chunk, on the other hand, rewrites the file tens of thousands of times over a
+        // large install, and inside the game directory that lands on the install volume, which
+        // for an SD card is slow, FUSE-backed storage shared with every other file operation.
+        private const val PERSIST_MIN_INTERVAL_MS = 2_000L
+        private const val PERSIST_MIN_BYTE_DELTA = 64L * 1024 * 1024
     }
 
     /**
      * Persist bytesDownloaded to a file in the app directory.
-     * Debounced to write at most once every 10 seconds to reduce I/O overhead.
      */
     fun persistBytesDownloaded(appDirPath: String) {
-        val now = System.currentTimeMillis()
-        val reserved = nextWriteTime.get()
-        val delayMs = reserved - now
-
-        // If we need to wait, schedule a delayed write
-        if (delayMs > 0) {
-            val currentGen = persistenceGeneration.get()
-            persistenceJob?.cancel()
-            persistenceJob = ioScope.launch {
-                delay(delayMs)
-                // Only write if generation hasn't been invalidated
-                if (persistenceGeneration.get() == currentGen) {
-                    writePersistedBytes(appDirPath)
-                }
-            }
-            return
-        }
-
-        // Reserve the next write time and write immediately. The generation guard
-        // keeps a late cancel-snapshot from recreating the resume file after
-        // clearPersistedBytesDownloaded() has removed it on completion.
-        nextWriteTime.set(now + PERSIST_DEBOUNCE_MS)
-        val currentGen = persistenceGeneration.get()
-        persistenceJob?.cancel()
-        persistenceJob = ioScope.launch {
-            if (persistenceGeneration.get() == currentGen) {
-                writePersistedBytes(appDirPath)
-            }
-        }
-    }
-
-    /**
-     * Internal method to actually write the bytes to disk.
-     */
-    private fun writePersistedBytes(appDirPath: String) {
         try {
             val dir = File(appDirPath, PERSISTENCE_DIR)
             if (!dir.exists()) {
@@ -342,8 +352,6 @@ data class DownloadInfo(
             }
             val file = File(dir, PERSISTENCE_FILE)
             file.writeText(bytesDownloaded.toString())
-            val now = System.currentTimeMillis()
-            nextWriteTime.set(now + PERSIST_DEBOUNCE_MS)
         } catch (e: Exception) {
             Timber.e(e, "Failed to persist bytes downloaded to $appDirPath")
         }
@@ -370,10 +378,9 @@ data class DownloadInfo(
     /**
      * Delete the persisted bytes file (called on download completion).
      */
+    @Synchronized
     fun clearPersistedBytesDownloaded(appDirPath: String) {
-        // Invalidate any pending persistence to prevent recreating the file
-        persistenceGeneration.incrementAndGet()
-        persistenceJob?.cancel()
+        persistenceGeneration += 1L
         try {
             val file = File(File(appDirPath, PERSISTENCE_DIR), PERSISTENCE_FILE)
             if (file.exists()) {

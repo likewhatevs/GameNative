@@ -2,32 +2,18 @@ package app.gamenative.data
 
 import java.io.File
 import java.util.concurrent.CopyOnWriteArrayList
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
-import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
-import org.junit.Before
-import org.junit.Test
 import org.junit.Rule
+import org.junit.Test
 import org.junit.rules.TemporaryFolder
 
 class DownloadInfoTest {
     @get:Rule
-    val tempFolder = TemporaryFolder()
+    val temporaryFolder = TemporaryFolder()
 
-    private lateinit var testDir: File
-
-    @Before
-    fun setup() {
-        testDir = tempFolder.newFolder()
-    }
-
-    @After
-    fun cleanup() {
-        testDir.deleteRecursively()
-    }
     @Test
     fun `post install sync state is tracked independently`() {
         val info = DownloadInfo(
@@ -59,109 +45,115 @@ class DownloadInfoTest {
     }
 
     @Test
-    fun `rapid persistence calls do not trigger multiple immediate writes`() = runBlocking {
-        val info = DownloadInfo(
-            jobCount = 1,
-            gameId = 123,
-            downloadingAppIds = CopyOnWriteArrayList(),
-        )
+    fun `rapid progress snapshots are throttled to few disk writes`() {
+        val appDir = temporaryFolder.newFolder("throttle")
+        val clock = FakeClock()
+        val info = newDownloadInfo(appDir, clock)
 
-        info.setTotalExpectedBytes(1000L)
-        info.updateBytesDownloaded(100L)
+        // First call always writes; the following 999 land inside the same throttle window.
+        var writes = 0
+        repeat(1000) {
+            info.updateBytesDownloaded(1024L, clock.nowMs, trackSpeed = false)
+            info.persistProgressSnapshot()
+            if (consumeWrite(appDir)) writes++
+        }
+        assertEquals(1, writes)
 
-        // First call should write immediately
-        info.persistBytesDownloaded(testDir.absolutePath)
-        delay(100)
+        // Crossing the time window allows exactly one more write.
+        clock.nowMs += 10_000L
+        info.updateBytesDownloaded(1024L, clock.nowMs, trackSpeed = false)
+        info.persistProgressSnapshot()
+        assertTrue(consumeWrite(appDir))
 
-        val firstValue = info.loadPersistedBytesDownloaded(testDir.absolutePath)
-        assertEquals(100L, firstValue)
-
-        // Rapid subsequent calls within debounce window
-        info.updateBytesDownloaded(50L)
-        info.persistBytesDownloaded(testDir.absolutePath)
-        info.updateBytesDownloaded(50L)
-        info.persistBytesDownloaded(testDir.absolutePath)
-        info.updateBytesDownloaded(50L)
-        info.persistBytesDownloaded(testDir.absolutePath)
-
-        // Should still show first write value immediately
-        val secondValue = info.loadPersistedBytesDownloaded(testDir.absolutePath)
-        assertEquals(100L, secondValue)
-
-        // Wait for debounced write to complete
-        delay(11_000)
-
-        // Now should show updated value
-        val finalValue = info.loadPersistedBytesDownloaded(testDir.absolutePath)
-        assertEquals(250L, finalValue)
+        info.updateBytesDownloaded(1024L, clock.nowMs, trackSpeed = false)
+        info.persistProgressSnapshot()
+        assertFalse(consumeWrite(appDir))
     }
 
     @Test
-    fun `clearPersistedBytesDownloaded cancels pending writes`() = runBlocking {
-        val info = DownloadInfo(
-            jobCount = 1,
-            gameId = 123,
-            downloadingAppIds = CopyOnWriteArrayList(),
-        )
+    fun `large byte delta persists without waiting for the time window`() {
+        val appDir = temporaryFolder.newFolder("delta")
+        val clock = FakeClock()
+        val info = newDownloadInfo(appDir, clock)
 
-        info.setTotalExpectedBytes(1000L)
-        info.updateBytesDownloaded(100L)
+        info.persistProgressSnapshot()
+        assertTrue(consumeWrite(appDir))
 
-        // Write initial value
-        info.persistBytesDownloaded(testDir.absolutePath)
-        delay(100)
-
-        val firstValue = info.loadPersistedBytesDownloaded(testDir.absolutePath)
-        assertEquals(100L, firstValue)
-
-        // Update and schedule a delayed write
-        info.updateBytesDownloaded(200L)
-        info.persistBytesDownloaded(testDir.absolutePath)
-
-        // Clear the file before the delayed write executes
-        info.clearPersistedBytesDownloaded(testDir.absolutePath)
-
-        // File should be deleted
-        val clearedValue = info.loadPersistedBytesDownloaded(testDir.absolutePath)
-        assertEquals(0L, clearedValue)
-
-        // Wait for what would have been the delayed write
-        delay(11_000)
-
-        // File should still be deleted (pending write was invalidated)
-        val finalValue = info.loadPersistedBytesDownloaded(testDir.absolutePath)
-        assertEquals(0L, finalValue)
+        info.updateBytesDownloaded(64L * 1024 * 1024, clock.nowMs, trackSpeed = false)
+        info.persistProgressSnapshot()
+        assertTrue(consumeWrite(appDir))
     }
 
     @Test
-    fun `completion during debounce interval prevents file recreation`() = runBlocking {
-        val info = DownloadInfo(
+    fun `forced snapshot writes the exact byte count after a suppressed call`() {
+        val appDir = temporaryFolder.newFolder("forced")
+        val clock = FakeClock()
+        val info = newDownloadInfo(appDir, clock)
+
+        info.updateBytesDownloaded(4096L, clock.nowMs, trackSpeed = false)
+        info.persistProgressSnapshot()
+        assertTrue(consumeWrite(appDir))
+
+        info.updateBytesDownloaded(2048L, clock.nowMs, trackSpeed = false)
+        info.persistProgressSnapshot()
+        assertFalse("throttled call must not write", consumeWrite(appDir))
+
+        info.persistProgressSnapshot(force = true)
+        assertEquals("6144", persistedFile(appDir).readText())
+    }
+
+    @Test
+    fun `cancel persists the final byte count`() = runBlocking {
+        val appDir = temporaryFolder.newFolder("cancel")
+        val clock = FakeClock()
+        val info = newDownloadInfo(appDir, clock)
+
+        info.updateBytesDownloaded(4096L, clock.nowMs, trackSpeed = false)
+        info.persistProgressSnapshot()
+        consumeWrite(appDir)
+        info.updateBytesDownloaded(1L, clock.nowMs, trackSpeed = false)
+
+        info.cancel().join()
+
+        assertEquals("4097", persistedFile(appDir).readText())
+    }
+
+    @Test
+    fun `completion clear cannot be undone by an asynchronous cancel snapshot`() = runBlocking {
+        val appDir = temporaryFolder.newFolder("cancel-clear-race")
+        val clock = FakeClock()
+        val info = newDownloadInfo(appDir, clock)
+
+        info.updateBytesDownloaded(4096L, clock.nowMs, trackSpeed = false)
+        val cancellation = info.cancel()
+        info.clearPersistedBytesDownloaded(appDir.absolutePath)
+        cancellation.join()
+
+        assertFalse(persistedFile(appDir).exists())
+    }
+
+    private class FakeClock(var nowMs: Long = 1_000L)
+
+    private fun newDownloadInfo(appDir: File, clock: FakeClock): DownloadInfo =
+        DownloadInfo(
             jobCount = 1,
             gameId = 123,
             downloadingAppIds = CopyOnWriteArrayList(),
-        )
+        ).also {
+            it.setTimeSource { clock.nowMs }
+            it.setPersistencePath(appDir.absolutePath)
+        }
 
-        info.setTotalExpectedBytes(1000L)
-        info.updateBytesDownloaded(500L)
+    private fun persistedFile(appDir: File): File = File(File(appDir, ".DownloadInfo"), "bytes_downloaded.txt")
 
-        // Write initial progress
-        info.persistBytesDownloaded(testDir.absolutePath)
-        delay(100)
-
-        assertEquals(500L, info.loadPersistedBytesDownloaded(testDir.absolutePath))
-
-        // Schedule another write within debounce window
-        info.updateBytesDownloaded(200L)
-        info.persistBytesDownloaded(testDir.absolutePath)
-
-        // Download completes and clears the file
-        info.clearPersistedBytesDownloaded(testDir.absolutePath)
-        assertEquals(0L, info.loadPersistedBytesDownloaded(testDir.absolutePath))
-
-        // Wait for the scheduled write delay
-        delay(11_000)
-
-        // File should remain deleted
-        assertEquals(0L, info.loadPersistedBytesDownloaded(testDir.absolutePath))
+    /**
+     * Returns whether a write happened since the last check, removing the file so the next
+     * check starts from a clean slate. Deleting it does not disturb the throttle state.
+     */
+    private fun consumeWrite(appDir: File): Boolean {
+        val file = persistedFile(appDir)
+        if (!file.exists()) return false
+        file.delete()
+        return true
     }
 }
