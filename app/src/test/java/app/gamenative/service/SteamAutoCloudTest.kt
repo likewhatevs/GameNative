@@ -3290,4 +3290,26 @@ class SteamAutoCloudTest {
         )
     }
 
+    // The deny-list is the second line of defence for a rule that does set recursive.
+    @Test
+    fun recursiveRule_stillDropsGodotCaches() = runBlocking {
+        installDomeKeeperLayout(domeKeeperPattern.copy(recursive = 1))
+
+        val result = SteamAutoCloud.syncUserFiles(
+            appInfo = db.steamAppDao().findApp(steamAppId)!!,
+            clientId = clientId,
+            steamInstance = mockSteamService,
+            steamCloud = mockSteamCloud,
+            preferredSave = SaveLocation.None,
+            prefixToPath = makePrefixToPath(),
+        ).await()
+
+        assertNotNull(result)
+        assertEquals(
+            "the subdirectory save is swept, the caches and logs are not",
+            3,
+            result!!.filesManaged,
+        )
+    }
+
 }
