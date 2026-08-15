@@ -48,16 +48,21 @@ object DownloadService {
 
         // externalVolumePaths and the base dirs feed SteamService.allInstallPaths
         SteamService.invalidateInstallPathCaches()
-
-        migrateExternalStoragePath()
     }
 
     // Android/data paths pay a ~1000x FUSE metadata penalty (MediaProvider disables kernel
-    // caching there); repoint the install pref at the public root so new installs avoid it
-    private fun migrateExternalStoragePath() {
+    // caching there); repoint the install pref at the public root so new installs avoid it.
+    //
+    // Deliberately not part of [populateDownloadService]: this creates a directory and a
+    // .nomedia file on the install volume, and on an SD card those are FUSE writes, while
+    // populate runs on the main thread during Application.onCreate. Running it off that
+    // thread means a reader can now observe the pre-migration path; that is safe because
+    // the setter invalidates the resolved-path caches when its write commits, so anything
+    // that resolved against the old root is recomputed rather than left stale.
+    suspend fun migrateExternalStoragePath() = withContext(Dispatchers.IO) {
         val pref = PrefManager.externalStoragePath
-        if (pref.isBlank() || !pref.contains("/Android/data/")) return
-        val public = StorageUtils.publicInstallRoot(File(pref)) ?: return
+        if (pref.isBlank() || !pref.contains("/Android/data/")) return@withContext
+        val public = StorageUtils.publicInstallRoot(File(pref)) ?: return@withContext
         if (StorageUtils.ensureInstallRoot(public)) {
             Timber.i("Migrating external install root from $pref to ${public.absolutePath}")
             PrefManager.externalStoragePath = public.absolutePath
