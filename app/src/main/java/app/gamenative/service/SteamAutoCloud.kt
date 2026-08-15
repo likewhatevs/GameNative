@@ -215,7 +215,7 @@ object SteamAutoCloud {
      * Steam reports the app as having an upload in progress until its batch is completed, so a
      * session that died mid-upload keeps the next one from syncing until the batch is closed.
      */
-    private suspend fun closeAbandonedUploadBatch(steamCloud: SteamCloud, appId: Int) {
+    internal suspend fun closeAbandonedUploadBatch(steamCloud: SteamCloud, appId: Int) {
         val batchId = PrefManager.getLong(openUploadBatchKey(appId), 0L)
 
         if (batchId == 0L) {
