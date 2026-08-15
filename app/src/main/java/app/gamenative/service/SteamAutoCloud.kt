@@ -1,8 +1,10 @@
 package app.gamenative.service
 
+import android.database.sqlite.SQLiteBlobTooBigException
 import androidx.room.withTransaction
 import app.gamenative.PrefManager
 import app.gamenative.R
+import app.gamenative.data.FileChangeLists
 import app.gamenative.data.PostSyncInfo
 import app.gamenative.data.SaveFilePattern
 import app.gamenative.data.SteamApp
@@ -140,6 +142,19 @@ object SteamAutoCloud {
             sha = sha,
             wasCacheHit = false,
         )
+    }
+
+    /**
+     * Reads the cached file list, reporting an unreadably large row as no cache at all.
+     *
+     * The whole list lives in one column, so a big enough list exceeds the cursor window and every
+     * read of that row throws. Treating it as absent costs a full resync instead of wedging the app.
+     */
+    internal suspend fun getCachedFileList(steamInstance: SteamService, appId: Int): FileChangeLists? = try {
+        steamInstance.fileChangeListsDao.getByAppId(appId)
+    } catch (e: SQLiteBlobTooBigException) {
+        Timber.e(e, "Cached file list of $appId is too large to read, treating it as absent")
+        null
     }
 
     fun syncUserFiles(
@@ -801,7 +816,7 @@ object SteamAutoCloud {
         microsecTotal = measureTime {
             val localAppChangeNumber = overrideLocalChangeNumber ?: steamInstance.changeNumbersDao.getByAppId(appInfo.id)?.changeNumber ?: -1
 
-            val cachedFileList = steamInstance.fileChangeListsDao.getByAppId(appInfo.id)
+            val cachedFileList = getCachedFileList(steamInstance, appInfo.id)
             val cacheIsAbsentOrEmpty = cachedFileList == null || cachedFileList.userFileInfo.isEmpty()
             val changeNumber = if (!cacheIsAbsentOrEmpty && localAppChangeNumber >= 0) localAppChangeNumber else 0L
             val appFileListChange = steamCloud.getAppFileListChange(appInfo.id, changeNumber).await()
@@ -893,7 +908,7 @@ object SteamAutoCloud {
                 parentScope.async {
                     Timber.i("Uploading local user files")
 
-                    val fileChanges = steamInstance.fileChangeListsDao.getByAppId(appInfo.id).let {
+                    val fileChanges = getCachedFileList(steamInstance, appInfo.id).let {
                         val result = getFilesDiff(allLocalUserFiles, it?.userFileInfo ?: emptyList())
 
                         result.second
@@ -968,7 +983,7 @@ object SteamAutoCloud {
                     var hasLocalChanges: Boolean
 
                     microsecAcPrepUserFiles = measureTime {
-                        hasLocalChanges = steamInstance.fileChangeListsDao.getByAppId(appInfo.id)?.let {
+                        hasLocalChanges = getCachedFileList(steamInstance, appInfo.id)?.let {
                             getFilesDiff(allLocalUserFiles, it.userFileInfo).first
                         } == true
                     }.inWholeMicroseconds
