@@ -159,6 +159,37 @@ object SteamAutoCloud {
         null
     }
 
+    /** Preference holding the id of an upload batch this device opened and has not closed yet. */
+    internal fun openUploadBatchKey(appId: Int): String = "cloud_open_upload_batch_$appId"
+
+    /**
+     * Closes an upload batch an earlier session left open.
+     *
+     * Steam reports the app as having an upload in progress until its batch is completed, so a
+     * session that died mid-upload keeps the next one from syncing until the batch is closed.
+     */
+    private suspend fun closeAbandonedUploadBatch(steamCloud: SteamCloud, appId: Int) {
+        val batchId = PrefManager.getLong(openUploadBatchKey(appId), 0L)
+
+        if (batchId == 0L) {
+            return
+        }
+
+        Timber.w("Closing upload batch $batchId of $appId left open by an earlier session")
+
+        try {
+            steamCloud.completeAppUploadBatch(
+                appId = appId,
+                batchId = batchId,
+                batchEResult = EResult.Fail,
+            ).await()
+
+            PrefManager.setLongBlocking(openUploadBatchKey(appId), 0L)
+        } catch (e: Exception) {
+            Timber.w(e, "Could not close upload batch $batchId of $appId, leaving it recorded")
+        }
+    }
+
     fun syncUserFiles(
         appInfo: SteamApp,
         clientId: Long,
@@ -615,6 +646,10 @@ object SteamAutoCloud {
                     return@async UserFilesUploadResult(false, uploadBatchResponse.appChangeNumber, 0, 0L)
                 }
 
+                // Recorded before the first transfer so that a session killed mid-upload can still
+                // close this batch on its next run.
+                PrefManager.setLongBlocking(openUploadBatchKey(appInfo.id), uploadBatchResponse.batchID)
+
                 var uploadBatchSuccess = true
 
                 try {
@@ -814,6 +849,8 @@ object SteamAutoCloud {
                             batchId = uploadBatchResponse.batchID,
                             batchEResult = batchEResult,
                         ).await()
+
+                        PrefManager.setLongBlocking(openUploadBatchKey(appInfo.id), 0L)
                     }
                 }
 
@@ -852,6 +889,8 @@ object SteamAutoCloud {
         var lastCloudAppChangeNumber = -1L
 
         microsecTotal = measureTime {
+            closeAbandonedUploadBatch(steamCloud, appInfo.id)
+
             val localAppChangeNumber = overrideLocalChangeNumber ?: steamInstance.changeNumbersDao.getByAppId(appInfo.id)?.changeNumber ?: -1
 
             val cachedFileList = getCachedFileList(steamInstance, appInfo.id)
