@@ -1,6 +1,7 @@
 package app.gamenative.service
 
 import android.content.Context
+import android.database.sqlite.SQLiteBlobTooBigException
 import androidx.room.Room
 import androidx.test.core.app.ApplicationProvider
 import app.gamenative.data.ConfigInfo
@@ -11,6 +12,7 @@ import app.gamenative.data.SteamApp
 import app.gamenative.data.SteamFileHashCache
 import app.gamenative.data.UFS
 import app.gamenative.db.PluviaDatabase
+import app.gamenative.db.dao.FileChangeListsDao
 import app.gamenative.enums.AppType
 import app.gamenative.enums.OS
 import app.gamenative.enums.PathType
@@ -3204,4 +3206,27 @@ class SteamAutoCloudTest {
         )
     }
 
+    private suspend fun runSync(): PostSyncInfo? = SteamAutoCloud.syncUserFiles(
+        appInfo = db.steamAppDao().findApp(steamAppId)!!,
+        clientId = clientId,
+        steamInstance = mockSteamService,
+        steamCloud = mockSteamCloud,
+        preferredSave = SaveLocation.None,
+        prefixToPath = makePrefixToPath(),
+    ).await()
+
+    @Test
+    fun oversizedCachedFileList_readsAsNoCache() = runBlocking {
+        val throwingDao = mock<FileChangeListsDao>()
+        whenever(throwingDao.getByAppId(any())).thenThrow(SQLiteBlobTooBigException())
+        whenever(mockSteamService.fileChangeListsDao).thenReturn(throwingDao)
+
+        assertNull(SteamAutoCloud.getCachedFileList(mockSteamService, steamAppId))
+
+        // and the sync it feeds must fall back to a full comparison instead of throwing
+        val result = runSync()
+
+        assertNotNull(result)
+        assertEquals(SyncResult.Conflict, result!!.syncResult)
+    }
 }
