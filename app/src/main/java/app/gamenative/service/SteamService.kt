@@ -1189,37 +1189,37 @@ class SteamService : Service(), IChallengeUrlChanged {
          * Resolve best matching directory: completed install > resumable partial >
          * any existing directory > null. Extracted for testability — called by [getAppDirPath].
          *
-         * Both hits short-circuit the walk. Stopping on the completion marker is
-         * unconditionally correct. Stopping on a resumable partial (see
-         * [MarkerUtils.hasResumablePartialInstall]) is what keeps the walk cheap while a
-         * download runs: without it every call probes every root, including the
-         * `/Android/data/` paths that carry the FUSE metadata penalty documented in
-         * DownloadService. That is safe because the only way a directory acquires
-         * [Marker.DOWNLOAD_IN_PROGRESS_MARKER] or persisted byte progress is by being the
-         * directory this same function resolved to when the download started — so no
-         * completed directory for the app existed at that point, and none can appear later
-         * at another root while the marker is there, because a later install resolves here
-         * too. A directory holding both markers still resolves as completed: that check
-         * runs first, at every root.
+         * Only [Marker.DOWNLOAD_COMPLETE_MARKER] short-circuits the walk; it is the
+         * strongest signal available and nothing found later can beat it. Partial matches
+         * are remembered and only applied once every root has been probed, so a completed
+         * install at any root always wins over a partial at any other root. That matters
+         * because [allInstallPaths] probes internal storage first: an abandoned download
+         * left there — by a process kill mid-install, a restored backup, or a directory
+         * from an older version — must not shadow the real install on a card and get the
+         * game re-downloaded.
+         *
+         * A resumable partial (see [MarkerUtils.hasResumablePartialInstall]) still beats a
+         * bare leftover directory with no markers and no persisted progress.
          */
         fun resolveExistingAppDir(installPaths: List<String>, names: List<String>): String? {
+            var firstResumable: String? = null
             var firstExisting: String? = null
             for (basePath in installPaths) {
                 for (name in names) {
                     if (name.isEmpty()) continue
                     val path = Paths.get(basePath, name)
-                    if (Files.isDirectory(path)) {
-                        if (MarkerUtils.hasMarker(path.pathString, Marker.DOWNLOAD_COMPLETE_MARKER)) {
-                            return path.pathString
-                        }
-                        if (MarkerUtils.hasResumablePartialInstall(path.pathString)) {
-                            return path.pathString
-                        }
-                        if (firstExisting == null) firstExisting = path.pathString
+                    if (!Files.isDirectory(path)) continue
+                    val dir = path.pathString
+                    if (MarkerUtils.hasMarker(dir, Marker.DOWNLOAD_COMPLETE_MARKER)) {
+                        return dir
                     }
+                    if (firstResumable == null && MarkerUtils.hasResumablePartialInstall(dir)) {
+                        firstResumable = dir
+                    }
+                    if (firstExisting == null) firstExisting = dir
                 }
             }
-            return firstExisting
+            return firstResumable ?: firstExisting
         }
 
         fun getAppDirPath(gameId: Int): String {
@@ -1259,9 +1259,9 @@ class SteamService : Service(), IChallengeUrlChanged {
         /**
          * Stamps the target directory as an active install, the same way
          * EpicDownloadManager, GOGDownloadManager and AmazonDownloadManager already do for
-         * their sources. The Steam path was the only one not following the convention.
-         * The marker gives [resolveExistingAppDir] somewhere to stop instead of probing
-         * every install root for the whole duration of the download.
+         * their sources. The Steam path was the only one not following the convention, so
+         * [MarkerUtils.hasResumablePartialInstall] had no way to tell an interrupted Steam
+         * download apart from an unrelated leftover directory.
          *
          * The directory has to exist for [MarkerUtils.addMarker] to write into it; the
          * downloader would create it moments later anyway.
@@ -1277,14 +1277,9 @@ class SteamService : Service(), IChallengeUrlChanged {
          * Clears the active-install stamp. Hung off the download job's completion handler
          * rather than the individual exit points, so it covers every terminal path the job
          * has — normal completion, the caught failure, and cancellation — without relying
-         * on an enumeration staying exhaustive.
-         *
-         * Process death leaves the marker behind, which is the same state the other three
-         * download managers leave and is what makes the install show as resumable. It stays
-         * correct for resolution too: an install can only be marked in the directory
-         * [resolveExistingAppDir] picked, so no completed copy existed elsewhere then, and
-         * none can be created elsewhere while the marker stands because the next install
-         * resolves back to this directory.
+         * on an enumeration staying exhaustive. A process kill leaves the marker behind,
+         * which is the same state the other three download managers leave and is what makes
+         * the install read as resumable afterwards.
          */
         private fun markInstallFinished(appId: Int, appDirPath: String) {
             MarkerUtils.removeMarker(appDirPath, Marker.DOWNLOAD_IN_PROGRESS_MARKER)
