@@ -3,6 +3,7 @@ package app.gamenative
 import android.content.Context
 import androidx.datastore.core.DataStore
 import androidx.datastore.core.handlers.ReplaceFileCorruptionHandler
+import androidx.datastore.preferences.core.MutablePreferences
 import androidx.datastore.preferences.core.Preferences
 import androidx.datastore.preferences.core.booleanPreferencesKey
 import androidx.datastore.preferences.core.byteArrayPreferencesKey
@@ -16,7 +17,6 @@ import androidx.datastore.preferences.preferencesDataStore
 import app.gamenative.data.GameSource
 import app.gamenative.powercontrol.autotuning.DeviceGate
 import app.gamenative.enums.AppTheme
-import app.gamenative.service.SteamService
 import app.gamenative.ui.enums.AppFilter
 import app.gamenative.ui.enums.HomeDestination
 import app.gamenative.ui.enums.Orientation
@@ -27,12 +27,15 @@ import com.winlator.container.Container
 import com.winlator.core.DefaultVersion
 import `in`.dragonbra.javasteam.enums.EPersonaState
 import java.util.EnumSet
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.asCoroutineDispatcher
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.json.Json
 import timber.log.Timber
 
@@ -42,22 +45,87 @@ import timber.log.Timber
  */
 object PrefManager {
 
+    /**
+     * Threads for everything that touches DataStore, including DataStore's own
+     * internals.
+     *
+     * Callers block on [awaitSnapshot] until the first on-disk snapshot has been
+     * published, so the work they wait on must never queue behind them. Sharing
+     * [kotlinx.coroutines.Dispatchers.IO] would allow exactly that: enough waiting
+     * callers occupy the whole pool and the load they wait for never gets a thread.
+     */
+    private val storageDispatcher = Executors.newCachedThreadPool { runnable ->
+        Thread(runnable, "PrefManager-storage").apply { isDaemon = true }
+    }.asCoroutineDispatcher()
+
+    private val scope = CoroutineScope(storageDispatcher + SupervisorJob())
+
     private val Context.datastore by preferencesDataStore(
         name = "PluviaPreferences",
         corruptionHandler = ReplaceFileCorruptionHandler {
             Timber.e("Preferences (somehow got) corrupted, resetting.")
             emptyPreferences()
         },
+        scope = CoroutineScope(storageDispatcher + SupervisorJob()),
     )
 
-    private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private val favoritePersistenceLock = Any()
     private var favoritePersistenceVersion = 0L
-
     private lateinit var dataStore: DataStore<Preferences>
 
+    /** Guards [dataStore], [snapshot], [load] and the ordering of queued writes. */
+    private val stateLock = Any()
+
+    /**
+     * In-memory mirror of the stored preferences, and the value every read is
+     * served from. Kept authoritative by applying each mutation here first and
+     * queueing the very same mutation for disk, so a read after a write always
+     * observes the write even though persisting it is asynchronous.
+     */
+    @Volatile
+    private var snapshot: Preferences = emptyPreferences()
+
+    /** A change to the stored preferences, waiting to be persisted. */
+    private class Write(
+        val block: (MutablePreferences) -> Unit,
+        /** Run once [block] has reached disk, for callers that need the commit, not just the value. */
+        val onCommitted: (() -> Unit)?,
+    )
+
+    /** Mutations waiting to be persisted, applied by [drainWrites] in the order they were made. */
+    private val writeQueue = Channel<Write>(Channel.UNLIMITED)
+
+    private var writesStarted = false
+
+    /** One attempt at reading the initial [snapshot] from disk. */
+    private class Load {
+        val done = CountDownLatch(1)
+
+        @Volatile
+        var failure: Throwable? = null
+    }
+
+    @Volatile
+    private var load: Load? = null
+
     fun init(context: Context) {
-        dataStore = context.datastore
+        val store = context.datastore
+
+        synchronized(stateLock) {
+            if (!::dataStore.isInitialized || dataStore !== store) {
+                dataStore = store
+                snapshot = emptyPreferences()
+                load = null
+            }
+            if (!writesStarted) {
+                writesStarted = true
+                scope.launch { drainWrites() }
+            }
+        }
+
+        // Load before returning: callers expect stored values, not defaults, the
+        // moment init() is done.
+        awaitSnapshot()
 
         // Note: Should remove after a few release versions. we've moved to encrypted values.
         val oldPassword = stringPreferencesKey("password")
@@ -81,11 +149,7 @@ object PrefManager {
         }
     }
 
-    fun clearPreferences() {
-        scope.launch {
-            dataStore.edit { it.clear() }
-        }
-    }
+    fun clearPreferences() = mutate { it.clear() }
 
     /**
      * Clears only Steam account/session state while preserving app-wide settings.
@@ -93,22 +157,18 @@ object PrefManager {
      * This is used during Steam logout so user-configured defaults (container
      * settings, download preferences, tips, theme, etc.) are not wiped.
      */
-    fun clearSteamSessionPreferences() {
-        scope.launch {
-            dataStore.edit { pref ->
-                pref.remove(USER_NAME)
-                pref.remove(ACCESS_TOKEN_ENC)
-                pref.remove(REFRESH_TOKEN_ENC)
-                pref.remove(CLIENT_ID)
-                pref.remove(PERSONA_STATE)
-                pref.remove(STEAM_USER_ACCOUNT_ID)
-                pref.remove(STEAM_USER_STEAM_ID_64)
-                pref.remove(STEAM_USER_AVATAR_HASH)
-                pref.remove(STEAM_USER_NAME)
-                pref.remove(LAST_PICS_CHANGE_NUMBER)
-                pref.remove(STEAM_GAMES_COUNT)
-            }
-        }
+    fun clearSteamSessionPreferences() = mutate { pref ->
+        pref.remove(USER_NAME)
+        pref.remove(ACCESS_TOKEN_ENC)
+        pref.remove(REFRESH_TOKEN_ENC)
+        pref.remove(CLIENT_ID)
+        pref.remove(PERSONA_STATE)
+        pref.remove(STEAM_USER_ACCOUNT_ID)
+        pref.remove(STEAM_USER_STEAM_ID_64)
+        pref.remove(STEAM_USER_AVATAR_HASH)
+        pref.remove(STEAM_USER_NAME)
+        pref.remove(LAST_PICS_CHANGE_NUMBER)
+        pref.remove(STEAM_GAMES_COUNT)
     }
 
     fun getBoolean(key: String, defaultValue: Boolean): Boolean =
@@ -124,22 +184,99 @@ object PrefManager {
         setPref(floatPreferencesKey(key), value)
 
     @Suppress("SameParameterValue")
-    private fun <T> getPref(key: Preferences.Key<T>, defaultValue: T): T = runBlocking {
-        dataStore.data.first()[key] ?: defaultValue
-    }
+    private fun <T> getPref(key: Preferences.Key<T>, defaultValue: T): T =
+        awaitSnapshot()[key] ?: defaultValue
 
     @Suppress("SameParameterValue")
-    private fun <T> setPref(key: Preferences.Key<T>, value: T, onCommitted: (() -> Unit)? = null) {
-        scope.launch {
-            dataStore.edit { pref -> pref[key] = value }
-            onCommitted?.invoke()
+    private fun <T> setPref(key: Preferences.Key<T>, value: T, onCommitted: (() -> Unit)? = null) =
+        mutate(onCommitted) { pref -> pref[key] = value }
+
+    private fun <T> removePref(key: Preferences.Key<T>) {
+        if (!awaitSnapshot().contains(key)) return
+        mutate { pref -> pref.remove(key) }
+    }
+
+    /**
+     * Returns the loaded preferences, reading them from the store first if that
+     * has not happened yet.
+     *
+     * The load runs on [scope] and is only ever awaited, never driven, by the
+     * calling thread, so a caller holding a thread of any other pool cannot
+     * starve it. A failed load is rethrown to the caller and retried on the next
+     * access rather than being papered over with defaults.
+     */
+    private fun awaitSnapshot(): Preferences {
+        val attempt = synchronized(stateLock) {
+            check(::dataStore.isInitialized) { "PrefManager.init(context) must be called before accessing preferences" }
+            val store = dataStore
+            val previous = load
+            if (previous != null && (previous.done.count > 0L || previous.failure == null)) {
+                previous
+            } else {
+                Load().also { attempt ->
+                    load = attempt
+                    scope.launch {
+                        try {
+                            val loaded = store.data.first()
+                            synchronized(stateLock) { snapshot = loaded }
+                        } catch (e: Throwable) {
+                            attempt.failure = e
+                        } finally {
+                            attempt.done.countDown()
+                        }
+                    }
+                }
+            }
+        }
+
+        attempt.done.await()
+        attempt.failure?.let { throw it }
+        return snapshot
+    }
+
+    /**
+     * Applies [block] to the in-memory snapshot and queues the identical change
+     * for disk, so both always agree and writes land in call order.
+     */
+    private fun mutate(onCommitted: (() -> Unit)? = null, block: (MutablePreferences) -> Unit) {
+        // Outside the lock: the mutation has to be applied on top of the stored
+        // values, and loading them can block.
+        awaitSnapshot()
+
+        synchronized(stateLock) {
+            val updated = snapshot.toMutablePreferences()
+            block(updated)
+            snapshot = updated.toPreferences()
+            val queued = writeQueue.trySend(Write(block, onCommitted))
+            if (queued.isFailure) {
+                Timber.e("Could not queue a preference write, it will not be persisted")
+            }
         }
     }
 
-    private fun <T> removePref(key: Preferences.Key<T>) {
-        scope.launch {
-            dataStore.edit { pref -> pref.remove(key) }
+    private suspend fun drainWrites() {
+        for (write in writeQueue) {
+            try {
+                dataStore.edit { pref -> write.block(pref) }
+                write.onCommitted?.invoke()
+            } catch (e: Exception) {
+                // Keep draining: dropping the queue would silently lose every later write.
+                Timber.e(e, "Failed to persist preferences")
+            }
         }
+    }
+
+    /**
+     * Blocks until every write queued so far has been committed to disk.
+     * Returns false if that did not happen within [timeoutMs].
+     */
+    internal fun awaitPendingWrites(timeoutMs: Long): Boolean {
+        val committed = CountDownLatch(1)
+        val queued = writeQueue.trySend(Write(block = {}, onCommitted = { committed.countDown() }))
+        if (queued.isFailure) {
+            return false
+        }
+        return committed.await(timeoutMs, TimeUnit.MILLISECONDS)
     }
 
     /* Manifest Cache */
@@ -848,11 +985,9 @@ object PrefManager {
     // Special: Because null value.
     private val CLIENT_ID = longPreferencesKey("client_id")
     var clientId: Long?
-        get() = runBlocking { dataStore.data.first()[CLIENT_ID] }
+        get() = awaitSnapshot()[CLIENT_ID]
         set(value) {
-            scope.launch {
-                dataStore.edit { pref -> pref[CLIENT_ID] = value!! }
-            }
+            mutate { pref -> pref[CLIENT_ID] = value!! }
         }
 
     private val LIBRARY_LAYOUT = intPreferencesKey("library_layout")
@@ -1260,12 +1395,8 @@ object PrefManager {
     var useExternalStorage: Boolean
         get() = getPref(USE_EXTERNAL_STORAGE, false)
         set(value) {
-            // Both writes commit asynchronously on a multi-threaded dispatcher, so each one
-            // invalidates when it lands; invalidating only up front would let a read racing
-            // the write re-cache the old roots permanently.
-            SteamService.invalidateInstallPathCaches()
-            setPref(USE_EXTERNAL_STORAGE, value) { SteamService.invalidateInstallPathCaches() }
-            setPref(EXTERNAL_STORAGE_PATH, "") { SteamService.invalidateInstallPathCaches() }
+            setPref(USE_EXTERNAL_STORAGE, value)
+            setPref(EXTERNAL_STORAGE_PATH, "")
         }
 
     private val FETCH_STEAMGRIDDB_IMAGES = booleanPreferencesKey("fetch_steamgriddb_images")
@@ -1279,8 +1410,7 @@ object PrefManager {
     var externalStoragePath: String
         get() = getPref(EXTERNAL_STORAGE_PATH, "")
         set(value) {
-            SteamService.invalidateInstallPathCaches()
-            setPref(EXTERNAL_STORAGE_PATH, value) { SteamService.invalidateInstallPathCaches() }
+            setPref(EXTERNAL_STORAGE_PATH, value)
         }
 
     private val FRONTEND_SYNC_DIR_STEAM = stringPreferencesKey("frontend_sync_dir_steam")
@@ -1378,13 +1508,13 @@ object PrefManager {
             }
             scope.launch {
                 val serialized = Json.encodeToString(value)
-                dataStore.edit { pref ->
-                    val isLatest = synchronized(favoritePersistenceLock) {
-                        version == favoritePersistenceVersion
-                    }
-                    if (isLatest) {
-                        pref[FAVORITE_APP_IDS] = serialized
-                    }
+                val isLatest = synchronized(favoritePersistenceLock) {
+                    version == favoritePersistenceVersion
+                }
+                if (isLatest) {
+                    // Reads are served from the authoritative in-memory snapshot. A direct
+                    // DataStore edit would reach disk but remain invisible for this process.
+                    setPref(FAVORITE_APP_IDS, serialized)
                 }
             }
         }
