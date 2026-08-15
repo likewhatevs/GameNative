@@ -2066,75 +2066,77 @@ class SteamService : Service(), IChallengeUrlChanged {
                             mkdirs()
                         }
 
-                        // Create DepotDownloader instance
-                        val depotDownloader = DepotDownloader(
-                            instance!!.steamClient!!,
-                            licenses,
-                            debug = false,
-                            androidEmulation = true,
-                            maxDownloads = maxDownloads,
-                            maxDecompress = maxDecompress,
-                            parentJob = coroutineContext[Job],
-                            autoStartDownload = false,
-                            skipLargeFileAllocation = chunkStagingRedirectDir != null,
-                            filesystem = CaseInsensitiveFileSystem(
-                                showDebugLog = false,
-                                chunkStagingRedirect = chunkStagingRedirectDir?.absolutePath?.toPath(),
-                            ),
-                        )
-
-                        // Create listeners for DLC apps
                         val depotIdToIndex = selectedDepots.keys.mapIndexed { index, depotId -> depotId to index }.toMap()
-                        val listener = AppDownloadListener(di, depotIdToIndex)
-                        depotDownloader.addListener(listener)
 
                         val branchPassword = instance?.steamUnlockedBranchDao
                             ?.getSteamUnlockedBranches(appId)
                             ?.firstOrNull { it.branchName == branch }
                             ?.password
 
-                        if (mainAppDepots.isNotEmpty()) {
-                            val mainAppDepotIds = mainAppDepots.keys.sorted()
+                        // The AppItems to download: the base game first, then each DLC.
+                        val appItems = buildList {
+                            if (mainAppDepots.isNotEmpty()) {
+                                add(
+                                    AppItem(
+                                        appId,
+                                        installDirectory = getAppDirPath(appId),
+                                        depot = mainAppDepots.keys.sorted(),
+                                        branch = branch,
+                                        branchPassword = branchPassword,
+                                    ),
+                                )
+                            }
 
-                            val mainAppItem = AppItem(
-                                appId,
-                                installDirectory = getAppDirPath(appId),
-                                depot = mainAppDepotIds,
-                                branch = branch,
-                                branchPassword = branchPassword,
-                            )
+                            calculatedDlcAppIds.forEach { dlcAppId ->
+                                val dlcDepotIds = selectedDepots
+                                    .filter { it.value.dlcAppId == dlcAppId }
+                                    .keys.sorted()
 
-                            depotDownloader.add(mainAppItem)
+                                add(
+                                    AppItem(
+                                        dlcAppId,
+                                        installDirectory = getAppDirPath(appId),
+                                        depot = dlcDepotIds,
+                                        branch = branch,
+                                        branchPassword = branchPassword,
+                                    ),
+                                )
+                            }
                         }
-
-                        calculatedDlcAppIds.forEach { dlcAppId ->
-                            val dlcDepots = selectedDepots.filter { it.value.dlcAppId == dlcAppId }
-                            val dlcDepotIds = dlcDepots.keys.sorted()
-
-                            val dlcAppItem = AppItem(
-                                dlcAppId,
-                                installDirectory = getAppDirPath(appId),
-                                depot = dlcDepotIds,
-                                branch = branch,
-                                branchPassword = branchPassword,
-                            )
-
-                            depotDownloader.add(dlcAppItem)
-                        }
-
-                        // Signal that no more items will be added
-                        depotDownloader.finishAdding()
-
-                        // Start Download
-                        depotDownloader.startDownloading()
 
                         Timber.i("Downloading game to " + defaultAppInstallPath)
 
-                        // Wait for completion
-                        depotDownloader.getCompletion().await()
+                        // Download each AppItem through its OWN DepotDownloader, one at a time.
+                        // A single shared downloader runs every item through one pipeline; when a
+                        // small DLC depot finishes and pendingChunks momentarily hits zero,
+                        // isLastDepot cancels the shared chunk/decompress jobs out from under an
+                        // item that is still downloading, hanging DLC-heavy games (e.g. Dome Keeper)
+                        // at N% forever. Isolating the pipeline per item avoids the race; within-item
+                        // depot and chunk parallelism is unaffected.
+                        for (appItem in appItems) {
+                            val depotDownloader = DepotDownloader(
+                                instance!!.steamClient!!,
+                                licenses,
+                                debug = false,
+                                androidEmulation = true,
+                                maxDownloads = maxDownloads,
+                                maxDecompress = maxDecompress,
+                                parentJob = coroutineContext[Job],
+                                autoStartDownload = false,
+                                skipLargeFileAllocation = chunkStagingRedirectDir != null,
+                                filesystem = CaseInsensitiveFileSystem(
+                                    showDebugLog = false,
+                                    chunkStagingRedirect = chunkStagingRedirectDir?.absolutePath?.toPath(),
+                                ),
+                            )
 
-                        // Close the downloader
-                        depotDownloader.close()
+                            depotDownloader.addListener(AppDownloadListener(di, depotIdToIndex))
+                            depotDownloader.add(appItem)
+                            depotDownloader.finishAdding()
+                            depotDownloader.startDownloading()
+                            depotDownloader.getCompletion().await()
+                            depotDownloader.close()
+                        }
 
                         val appConfig = getAppInfoOf(appId)?.config
                         if (appConfig?.steamControllerTemplateIndex == 1) {
