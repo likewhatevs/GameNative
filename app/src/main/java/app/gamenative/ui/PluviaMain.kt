@@ -2274,6 +2274,7 @@ fun preLaunchApp(
             SyncResult.UnknownFail,
             SyncResult.DownloadFail,
             SyncResult.UpdateFail,
+            SyncResult.QuotaExceeded,
             -> {
                 setMessageDialogState(
                     MessageDialogState(

@@ -3221,7 +3221,7 @@ class SteamAutoCloudTest {
      *
      * Also puts a stale, non-empty cache in the db so the sync takes the upload path.
      */
-    private fun installDomeKeeperLayout(pattern: SaveFilePattern) = runBlocking {
+    private fun installDomeKeeperLayout(pattern: SaveFilePattern, maxNumFiles: Int = 0) = runBlocking {
         saveFilesDir.listFiles()?.forEach { it.deleteRecursively() }
 
         File(saveFilesDir, "savegame_0.json").writeText("save")
@@ -3237,7 +3237,7 @@ class SteamAutoCloudTest {
 
         val testApp = db.steamAppDao().findApp(steamAppId)!!
         db.steamAppDao().update(
-            testApp.copy(ufs = UFS(saveFilePatterns = listOf(pattern))),
+            testApp.copy(ufs = UFS(maxNumFiles = maxNumFiles, saveFilePatterns = listOf(pattern))),
         )
 
         db.appChangeNumbersDao().deleteByAppId(steamAppId)
@@ -3312,4 +3312,55 @@ class SteamAutoCloudTest {
         )
     }
 
+    // ── Quota pre-flight ──
+    @Test
+    fun uploadIsRefusedWhenTheSaveSetExceedsMaxNumFiles() = runBlocking {
+        installDomeKeeperLayout(domeKeeperPattern, maxNumFiles = 1)
+
+        val result = SteamAutoCloud.syncUserFiles(
+            appInfo = db.steamAppDao().findApp(steamAppId)!!,
+            clientId = clientId,
+            steamInstance = mockSteamService,
+            steamCloud = mockSteamCloud,
+            preferredSave = SaveLocation.None,
+            prefixToPath = makePrefixToPath(),
+        ).await()
+
+        assertNotNull(result)
+        assertEquals(SyncResult.QuotaExceeded, result!!.syncResult)
+        assertEquals("nothing may be uploaded", 0, result.filesUploaded)
+        io.mockk.verify(exactly = 0) {
+            mockSteamCloud.beginAppUploadBatch(any(), any(), any(), any(), any(), any(), any())
+        }
+    }
+
+    @Test
+    fun quotaCheckReportsTheFileCountBeforeTheByteTotal() {
+        val violation = SteamAutoCloud.checkQuota(
+            ufs = UFS(quota = 10, maxNumFiles = 1),
+            fileCount = 2,
+            totalBytes = 100L,
+        )
+
+        assertNotNull(violation)
+        assertTrue(
+            "the file count binds first and must be the reported reason: $violation",
+            violation!!.contains("exceeds the app's limit of 1"),
+        )
+    }
+
+    @Test
+    fun quotaCheckCatchesTheByteTotal() {
+        assertNotNull(
+            SteamAutoCloud.checkQuota(UFS(quota = 10, maxNumFiles = 100), fileCount = 1, totalBytes = 11L),
+        )
+        assertNull(
+            SteamAutoCloud.checkQuota(UFS(quota = 10, maxNumFiles = 100), fileCount = 1, totalBytes = 10L),
+        )
+    }
+
+    @Test
+    fun quotaCheckIsSkippedWhenTheAppDeclaresNoLimit() {
+        assertNull(SteamAutoCloud.checkQuota(UFS(), fileCount = 100_000, totalBytes = Long.MAX_VALUE))
+    }
 }
