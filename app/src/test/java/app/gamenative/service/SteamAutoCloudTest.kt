@@ -4,6 +4,7 @@ import android.content.Context
 import android.database.sqlite.SQLiteBlobTooBigException
 import androidx.room.Room
 import androidx.test.core.app.ApplicationProvider
+import app.gamenative.PrefManager
 import app.gamenative.data.ConfigInfo
 import app.gamenative.data.FileChangeLists
 import app.gamenative.data.PostSyncInfo
@@ -266,6 +267,10 @@ class SteamAutoCloudTest {
             db.appChangeNumbersDao().insert(app.gamenative.data.ChangeNumbers(steamAppId, 0))
             db.appFileChangeListsDao().insert(steamAppId, emptyList())
         }
+
+        // preferences outlive a single test, so start with no batch recorded as open
+        PrefManager.init(context)
+        PrefManager.setLongBlocking(SteamAutoCloud.openUploadBatchKey(steamAppId), 0L)
     }
 
     @After
@@ -3386,6 +3391,20 @@ class SteamAutoCloudTest {
         assertNotNull("the failure must reach the caller", thrown)
         verify { mockSteamCloud.completeAppUploadBatch(steamAppId, 7L, EResult.Fail, any()) }
         assertSyncStateUnchanged(changeNumber)
+    }
+
+    @Test
+    fun batchLeftOpenByAnEarlierSession_isClosedBeforeSyncing() = runBlocking {
+        PrefManager.setLongBlocking(SteamAutoCloud.openUploadBatchKey(steamAppId), 42L)
+
+        runSync()
+
+        verify { mockSteamCloud.completeAppUploadBatch(steamAppId, 42L, EResult.Fail, any()) }
+        assertEquals(
+            "a closed batch must not be closed again on the next sync",
+            0L,
+            PrefManager.getLong(SteamAutoCloud.openUploadBatchKey(steamAppId), 0L),
+        )
     }
 
     @Test

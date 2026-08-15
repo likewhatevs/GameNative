@@ -120,6 +120,16 @@ object PrefManager {
     fun setFloat(key: String, value: Float): Unit =
         setPref(floatPreferencesKey(key), value)
 
+    fun getLong(key: String, defaultValue: Long): Long =
+        getPref(longPreferencesKey(key), defaultValue)
+
+    /** Unlike [setFloat] this returns only once the value is stored, for callers that must not lose it to a crash. */
+    fun setLongBlocking(key: String, value: Long) {
+        runBlocking {
+            dataStore.edit { pref -> pref[longPreferencesKey(key)] = value }
+        }
+    }
+
     @Suppress("SameParameterValue")
     private fun <T> getPref(key: Preferences.Key<T>, defaultValue: T): T = runBlocking {
         dataStore.data.first()[key] ?: defaultValue
