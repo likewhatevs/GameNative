@@ -1114,12 +1114,20 @@ abstract class BaseAppScreen {
     }
 
     /**
-     * Get the options menu items specific to this game source
+     * Get the options menu items specific to this game source.
+     *
+     * [isInstalled] comes from the caller's already-resolved screen state rather than being
+     * probed here. A composable that returns a value is never skippable, so this body re-runs
+     * on every recomposition of the app screen — which during a download is once per completed
+     * chunk. Probing here meant a marker stat on the install volume at that rate, on the main
+     * thread, against the card the download is already saturating. It also let the menu
+     * disagree with the Install/Play button, which reads the same state.
      */
     @Composable
     fun getOptionsMenu(
         context: Context,
         libraryItem: LibraryItem,
+        isInstalled: Boolean,
         onEditContainer: () -> Unit,
         onBack: () -> Unit,
         onClickPlay: (Boolean) -> Unit,
@@ -1127,7 +1135,6 @@ abstract class BaseAppScreen {
         onPlayWithDiagnostics: () -> Unit,
         exportFrontendLauncher: ActivityResultLauncher<String>,
     ): List<AppMenuOption> {
-        val isInstalled = isInstalled(context, libraryItem)
         val menuOptions = mutableListOf<AppMenuOption>()
 
         // Always available: Edit Container
@@ -1532,7 +1539,17 @@ abstract class BaseAppScreen {
                 }
         }
 
-        val optionsMenu = getOptionsMenu(context, libraryItem, onEditContainer, onBack, onClickPlay, onTestGraphics, onPlayWithDiagnostics, exportFrontendLauncher)
+        val optionsMenu = getOptionsMenu(
+            context,
+            libraryItem,
+            isInstalledState,
+            onEditContainer,
+            onBack,
+            onClickPlay,
+            onTestGraphics,
+            onPlayWithDiagnostics,
+            exportFrontendLauncher,
+        )
 
         // Get download info based on game source for progress tracking
         val downloadInfo = when (libraryItem.gameSource) {
