@@ -1,9 +1,11 @@
 package app.gamenative.ui.screen.library.components
 
+import android.content.Context
 import android.graphics.drawable.ColorDrawable
 import android.view.KeyEvent
 import android.view.View
 import android.view.inputmethod.EditorInfo
+import android.view.inputmethod.InputMethodManager
 import android.widget.EditText
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.Spring
@@ -44,13 +46,10 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.focus.FocusDirection
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.platform.LocalFocusManager
-import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
@@ -70,6 +69,7 @@ fun LibrarySearchBar(
     onScrollToTop: suspend () -> Unit,
     onSearchQuery: (String) -> Unit,
     onDismiss: () -> Unit,
+    onLeaveField: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     AnimatedVisibility(
@@ -113,6 +113,7 @@ fun LibrarySearchBar(
                     onScrollToTop = onScrollToTop,
                     onSearchQuery = onSearchQuery,
                     onDismiss = onDismiss,
+                    onLeaveField = onLeaveField,
                 )
 
                 // Results count
@@ -139,18 +140,22 @@ private fun SearchBarInput(
     onScrollToTop: suspend () -> Unit,
     onSearchQuery: (String) -> Unit,
     onDismiss: () -> Unit,
+    onLeaveField: () -> Unit,
 ) {
-    val keyboardController = LocalSoftwareKeyboardController.current
-    val focusManager = LocalFocusManager.current
     val scope = rememberCoroutineScope()
     val currentOnSearchQuery = rememberUpdatedState(onSearchQuery)
     val currentOnScrollToTop = rememberUpdatedState(onScrollToTop)
+    val currentOnLeaveField = rememberUpdatedState(onLeaveField)
     var editTextRef by remember { mutableStateOf<EditText?>(null) }
     var isFocused by remember { mutableStateOf(false) }
 
-    // Request focus when search bar appears
+    // Request focus and raise the keyboard when the search bar appears. requestFocus()
+    // on its own leaves the field focused with the IME closed, so tapping the field was
+    // the only thing that ever opened it — impossible for a controller-only user.
     LaunchedEffect(editTextRef) {
-        editTextRef?.requestFocus()
+        val editText = editTextRef ?: return@LaunchedEffect
+        editText.requestFocus()
+        editText.showKeyboard()
     }
 
     val onSearchText: (String) -> Unit = { newText ->
@@ -244,9 +249,9 @@ private fun SearchBarInput(
                     textSize = 16f
 
                     // Handle search action
-                    setOnEditorActionListener { _, actionId, _ ->
+                    setOnEditorActionListener { v, actionId, _ ->
                         if (actionId == EditorInfo.IME_ACTION_SEARCH) {
-                            keyboardController?.hide()
+                            v.hideKeyboard()
                             true
                         } else {
                             false
@@ -255,13 +260,12 @@ private fun SearchBarInput(
 
                     // Handle D-pad navigation
                     setOnKeyListener { v, keyCode, event ->
-                        if (event.action == KeyEvent.ACTION_DOWN &&
-                            keyCode == KeyEvent.KEYCODE_DPAD_DOWN
-                        ) {
-                            keyboardController?.hide()
-                            // Use native focus search to find next focusable view below
-                            val nextFocus = v.focusSearch(View.FOCUS_DOWN)
-                            nextFocus?.requestFocus()
+                        if (consumesSearchFieldKey(event.action, keyCode)) {
+                            v.hideKeyboard()
+                            // The interop view holds the platform focus; Compose cannot
+                            // take it back until the view lets go.
+                            v.clearFocus()
+                            currentOnLeaveField.value()
                             true
                         } else {
                             false
@@ -319,6 +323,30 @@ private fun SearchBarInput(
     }
 }
 
+/**
+ * D-pad down is the search field's way out to the results below it. The field runs with
+ * the keyboard up, so every other key has to fall through: whatever it swallows here is a
+ * key the field, the IME and the library's own controller handling never get to see.
+ */
+internal fun consumesSearchFieldKey(action: Int, keyCode: Int): Boolean =
+    action == KeyEvent.ACTION_DOWN && keyCode == KeyEvent.KEYCODE_DPAD_DOWN
+
+// The search field is an interop EditText, not a Compose text field, and the Compose
+// software keyboard controller does not drive its IME. Go through the platform manager.
+
+private fun View.showKeyboard() {
+    // Explicit (flag 0) rather than SHOW_IMPLICIT: opening the search bar is a
+    // deliberate user action, not an incidental focus change.
+    inputMethodManager()?.showSoftInput(this, 0)
+}
+
+private fun View.hideKeyboard() {
+    inputMethodManager()?.hideSoftInputFromWindow(windowToken, 0)
+}
+
+private fun View.inputMethodManager(): InputMethodManager? =
+    context.getSystemService(Context.INPUT_METHOD_SERVICE) as? InputMethodManager
+
 /***********
  * PREVIEW *
  ***********/
@@ -337,6 +365,7 @@ private fun Preview_LibrarySearchBar() {
                 onScrollToTop = { },
                 onSearchQuery = { },
                 onDismiss = { },
+                onLeaveField = { },
             )
         }
     }
@@ -356,6 +385,7 @@ private fun Preview_LibrarySearchBar_Empty() {
                 onScrollToTop = { },
                 onSearchQuery = { },
                 onDismiss = { },
+                onLeaveField = { },
             )
         }
     }
