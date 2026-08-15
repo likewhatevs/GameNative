@@ -188,11 +188,27 @@ object SteamCloudCleanup {
                 PrefManager.setLongBlocking(batchKey, batch.batchID)
 
                 var batchSuccess = true
+                var deletedInChunk = 0
 
                 try {
-                    // Reported from inside the batch on purpose: anything that throws here, a
-                    // cancelled caller included, has to leave through the close below.
-                    onProgress?.invoke(deleted + chunk.size, paths.size)
+                    // Naming the files when the batch opens only declares the intent; each one
+                    // still has to be deleted individually inside the batch or Steam keeps them
+                    // and the batch completes clean anyway. This call also returns a per-file
+                    // result, which the batch never does, so failures stop being invisible.
+                    chunk.forEach { path ->
+                        val ok = steamCloud.deleteFile(appInfo.id, path, batch.batchID).await()
+
+                        if (ok) {
+                            deletedInChunk++
+                        } else {
+                            Timber.w("Steam refused to delete $path of ${appInfo.id}")
+                            failedPaths += path
+                        }
+
+                        // Reported from inside the batch on purpose: anything that throws here, a
+                        // cancelled caller included, has to leave through the close below.
+                        onProgress?.invoke(deleted + deletedInChunk, paths.size)
+                    }
                 } catch (e: Exception) {
                     batchSuccess = false
                     throw e
@@ -212,7 +228,7 @@ object SteamCloudCleanup {
                     }
                 }
 
-                deleted += chunk.size
+                deleted += deletedInChunk
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
