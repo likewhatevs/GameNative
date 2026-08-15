@@ -6,6 +6,7 @@ import app.gamenative.data.UFS
 import app.gamenative.enums.PathType
 import app.gamenative.utils.SteamSaveSweep
 import app.gamenative.utils.SteamUtils
+import `in`.dragonbra.javasteam.enums.EOSType
 import `in`.dragonbra.javasteam.enums.EResult
 import `in`.dragonbra.javasteam.steam.handlers.steamcloud.AppFileChangeList
 import `in`.dragonbra.javasteam.steam.handlers.steamcloud.SteamCloud
@@ -154,6 +155,11 @@ object SteamCloudCleanup {
 
         SteamAutoCloud.closeAbandonedUploadBatch(steamCloud, appInfo.id)
 
+        // Must precede the deletes. Steam accepts a delete batch while another client holds an
+        // upload pending for the app, and reports it complete, but does not apply it - the files
+        // are still listed by the next scan. Retire the stale flag first so these deletes land.
+        clearPendingRemoteOperations(appInfo, clientId, steamInstance, steamCloud)
+
         val batchKey = SteamAutoCloud.openUploadBatchKey(appInfo.id)
         val appBuildId = appInfo.branches[SteamService.getInstalledApp(appInfo.id)?.branch ?: "public"]?.buildId ?: 0
         val failedPaths = mutableListOf<String>()
@@ -217,6 +223,63 @@ object SteamCloudCleanup {
         Timber.i("Cloud cleanup of ${appInfo.id}: deleted $deleted of ${paths.size} file(s)")
 
         return CleanupResult(requested = paths.size, deleted = deleted, failedPaths = failedPaths)
+    }
+
+    /**
+     * Closes out any upload the cloud still believes is in flight for this app.
+     *
+     * Deleting the junk is only half of undoing a wedged sync. A run that died mid-upload also
+     * leaves Steam holding `UploadPending` for the client that started it, and Steam refuses to
+     * serve a clean sync while that flag stands - every later attempt fails with `DownloadFail`
+     * no matter how much junk has been removed since.
+     *
+     * [SteamAutoCloud.closeAbandonedUploadBatch] already covers a batch this install still
+     * remembers, but it reads the locally persisted batch id, which is gone once app data is
+     * cleared or the game is reinstalled. The flag on Steam's side outlives that record, so
+     * reconcile the way the file scan does - against what the cloud actually reports - and adopt
+     * the stale session so it can be closed.
+     *
+     * Best effort: the deletes have already succeeded by this point, so a failure here is logged
+     * rather than propagated.
+     */
+    private suspend fun clearPendingRemoteOperations(
+        appInfo: SteamApp,
+        clientId: Long,
+        steamInstance: SteamService,
+        steamCloud: SteamCloud,
+    ) {
+        try {
+            val pending = steamCloud.signalAppLaunchIntent(
+                appId = appInfo.id,
+                clientId = clientId,
+                machineName = SteamUtils.getMachineName(steamInstance),
+                // The point of this call: adopt the stale session rather than refuse to act on it.
+                ignorePendingOperations = true,
+                osType = EOSType.WinUnknown,
+            ).await()
+
+            if (pending.isEmpty()) {
+                Timber.i("No pending remote operations to clear for ${appInfo.id}")
+            } else {
+                Timber.i(
+                    "Clearing pending remote operations for %d: %s",
+                    appInfo.id,
+                    pending.joinToString { "${it.operation} on ${it.machineName} (client ${it.clientId})" },
+                )
+            }
+
+            // Tell Steam the session ended with nothing outstanding, which retires the flag.
+            steamCloud.signalAppExitSyncDone(
+                appId = appInfo.id,
+                clientId = clientId,
+                uploadsCompleted = true,
+                uploadsRequired = false,
+            )
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Timber.e(e, "Failed to clear pending remote operations for ${appInfo.id}")
+        }
     }
 
     internal fun toRemoteFiles(fileList: AppFileChangeList): List<RemoteFile> = fileList.files.map { file ->

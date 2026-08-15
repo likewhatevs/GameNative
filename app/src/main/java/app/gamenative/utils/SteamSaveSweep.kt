@@ -36,25 +36,63 @@ object SteamSaveSweep {
      * None of these names occurs as a path component of any `savefiles` rule in the 14 204-app
      * appinfo sample in ludusavi-manifest's steam-game-cache, i.e. no shipped rule targets them.
      */
-    private val DENIED_DIRECTORIES = setOf(
-        // Godot 4 writes its compiled-shader cache to user://shader_cache/<name>/<hash>/<hash>.cache
-        // under both the RenderingDevice and the Compatibility renderer.
-        "shader_cache",
-        // Godot 4 writes its pipeline cache to user://vulkan/pipelines.*.cache; the directory keeps
-        // the name "vulkan" under the other rendering backends too.
-        "vulkan",
-        // Godot's project-local generated data directory.
-        ".godot",
-        // Directories that are caches by name.
-        "cache",
-        "caches",
-        // Log and crash-dump directories (e.g. Godot's user://logs/). Diagnostics, not save data.
-        "logs",
-        "crashes",
+    /** How an [EngineDataRule] is matched against a path below a save rule's base directory. */
+    enum class EngineDataMatch {
+        /** Matches when any parent directory of the file has this name. */
+        Directory,
+
+        /** Matches when the file name ends with this suffix. */
+        FileSuffix,
+    }
+
+    /**
+     * One entry of the engine-data manifest.
+     *
+     * [reason] is not decoration: it is the record of why a path is considered regenerable, which
+     * is what makes an entry reviewable when a game turns out to keep real saves somewhere that
+     * merely reads like a cache.
+     */
+    data class EngineDataRule(
+        val match: EngineDataMatch,
+        val value: String,
+        val reason: String,
     )
 
-    /** File-name suffixes that are regenerable by name. Matched case-insensitively. */
-    private val DENIED_SUFFIXES = listOf(".cache")
+    /**
+     * The manifest of regenerable engine data.
+     *
+     * Declared in one place and consulted by every path that decides what may be uploaded or what
+     * may be deleted from the cloud, so the upload sweep and [app.gamenative.service.SteamCloudCleanup]
+     * can never drift apart on what counts as junk. Adding a game's cache directory is a data
+     * change here, not a code change at each call site.
+     *
+     * Matched case-insensitively, and only ever *below* a rule's own base directory, so a rule
+     * that deliberately points at one of these directories still syncs it.
+     */
+    val ENGINE_DATA_MANIFEST = listOf(
+        EngineDataRule(
+            EngineDataMatch.Directory, "shader_cache",
+            "Godot 4 compiled-shader cache: user://shader_cache/<name>/<hash>/<hash>.cache, " +
+                "under both the RenderingDevice and Compatibility renderers",
+        ),
+        EngineDataRule(
+            EngineDataMatch.Directory, "vulkan",
+            "Godot 4 pipeline cache: user://vulkan/pipelines.*.cache; the directory keeps this " +
+                "name under the other rendering backends too",
+        ),
+        EngineDataRule(EngineDataMatch.Directory, ".godot", "Godot's project-local generated data directory"),
+        EngineDataRule(EngineDataMatch.Directory, "cache", "Directory that is a cache by name"),
+        EngineDataRule(EngineDataMatch.Directory, "caches", "Directory that is a cache by name"),
+        EngineDataRule(EngineDataMatch.Directory, "logs", "Diagnostics, not save data (e.g. Godot's user://logs/)"),
+        EngineDataRule(EngineDataMatch.Directory, "crashes", "Crash dumps, not save data"),
+        EngineDataRule(EngineDataMatch.FileSuffix, ".cache", "Regenerable by name"),
+    )
+
+    private val DENIED_DIRECTORIES: Set<String> =
+        ENGINE_DATA_MANIFEST.filter { it.match == EngineDataMatch.Directory }.map { it.value }.toSet()
+
+    private val DENIED_SUFFIXES: List<String> =
+        ENGINE_DATA_MANIFEST.filter { it.match == EngineDataMatch.FileSuffix }.map { it.value }
 
     private val patternCache = ConcurrentHashMap<String, Regex>()
 
