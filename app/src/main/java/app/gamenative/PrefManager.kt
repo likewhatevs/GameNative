@@ -16,6 +16,7 @@ import androidx.datastore.preferences.preferencesDataStore
 import app.gamenative.data.GameSource
 import app.gamenative.powercontrol.autotuning.DeviceGate
 import app.gamenative.enums.AppTheme
+import app.gamenative.service.SteamService
 import app.gamenative.ui.enums.AppFilter
 import app.gamenative.ui.enums.HomeDestination
 import app.gamenative.ui.enums.Orientation
@@ -128,9 +129,10 @@ object PrefManager {
     }
 
     @Suppress("SameParameterValue")
-    private fun <T> setPref(key: Preferences.Key<T>, value: T) {
+    private fun <T> setPref(key: Preferences.Key<T>, value: T, onCommitted: (() -> Unit)? = null) {
         scope.launch {
             dataStore.edit { pref -> pref[key] = value }
+            onCommitted?.invoke()
         }
     }
 
@@ -1258,8 +1260,12 @@ object PrefManager {
     var useExternalStorage: Boolean
         get() = getPref(USE_EXTERNAL_STORAGE, false)
         set(value) {
-            setPref(USE_EXTERNAL_STORAGE, value)
-            setPref(EXTERNAL_STORAGE_PATH, "")
+            // Both writes commit asynchronously on a multi-threaded dispatcher, so each one
+            // invalidates when it lands; invalidating only up front would let a read racing
+            // the write re-cache the old roots permanently.
+            SteamService.invalidateInstallPathCaches()
+            setPref(USE_EXTERNAL_STORAGE, value) { SteamService.invalidateInstallPathCaches() }
+            setPref(EXTERNAL_STORAGE_PATH, "") { SteamService.invalidateInstallPathCaches() }
         }
 
     private val FETCH_STEAMGRIDDB_IMAGES = booleanPreferencesKey("fetch_steamgriddb_images")
@@ -1273,7 +1279,8 @@ object PrefManager {
     var externalStoragePath: String
         get() = getPref(EXTERNAL_STORAGE_PATH, "")
         set(value) {
-            setPref(EXTERNAL_STORAGE_PATH, value)
+            SteamService.invalidateInstallPathCaches()
+            setPref(EXTERNAL_STORAGE_PATH, value) { SteamService.invalidateInstallPathCaches() }
         }
 
     private val FRONTEND_SYNC_DIR_STEAM = stringPreferencesKey("frontend_sync_dir_steam")

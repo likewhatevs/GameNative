@@ -322,7 +322,11 @@ object ContainerStorageManager {
         val installSize = entry.gameInstallSizeBytes ?: StorageUtils.getFolderSize(targetDir.absolutePath)
         when (gameSource) {
             GameSource.STEAM -> {
-                steamGameId?.let { PluviaApp.events.emitJava(AndroidEvent.LibraryInstallStatusChanged(it, GameSource.STEAM)) }
+                steamGameId?.let {
+                    // the install just changed roots, so the cached resolution is wrong
+                    SteamService.invalidateAppDirCache(it)
+                    PluviaApp.events.emitJava(AndroidEvent.LibraryInstallStatusChanged(it, GameSource.STEAM))
+                }
             }
 
             GameSource.GOG -> {
