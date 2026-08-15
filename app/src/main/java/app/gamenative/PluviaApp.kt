@@ -102,7 +102,10 @@ class PluviaApp : SplitCompatApplication() {
 
         // Creates a directory and a .nomedia file on the install volume, which on an SD card
         // are FUSE writes — too slow to do while the main thread is starting the process.
+        // Volume discovery is the same kind of work: it creates Android/data/<pkg>/files on
+        // every removable volume and makes two binder calls per volume.
         appScope.launch {
+            DownloadService.discoverExternalVolumes(this@PluviaApp)
             DownloadService.migrateExternalStoragePath()
         }
 

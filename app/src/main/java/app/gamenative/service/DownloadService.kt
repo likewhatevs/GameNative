@@ -37,6 +37,25 @@ object DownloadService {
         val extFiles = context.getExternalFilesDir(null)
         baseExternalAppDirPath = extFiles?.parentFile?.path ?: ""
 
+        // the base dirs feed SteamService.allInstallPaths
+        SteamService.invalidateInstallPathCaches()
+    }
+
+    /**
+     * Discovers the mounted non-primary volumes (SD cards, USB) that can hold installs.
+     *
+     * Split out of [populateDownloadService], which stays on the main thread so the three base
+     * dir paths are published before anything can read them. This half has no such constraint
+     * and is the expensive half: [StorageUtils.getAllExternalFilesDirs] creates
+     * Android/data/<pkg>/files on every removable volume, which on an SD card is a chain of
+     * FUSE directory creations, and each volume then costs two StorageManager binder calls.
+     *
+     * The only readers are [SteamService.allInstallPaths] — recomputed on demand and dropped by
+     * the [SteamService.invalidateInstallPathCaches] call below — plus ContainerStorageManager
+     * and CustomGameScanner, neither of which runs before there is an Activity and a login. So
+     * the window where this list is still empty cannot leave a stale resolution behind.
+     */
+    suspend fun discoverExternalVolumes(context: Context) = withContext(Dispatchers.IO) {
         val sm = context.getSystemService(android.os.storage.StorageManager::class.java)
         val appFilesDirs = StorageUtils.getAllExternalFilesDirs(context)
             .filter { Environment.getExternalStorageState(it) == Environment.MEDIA_MOUNTED }
@@ -46,7 +65,6 @@ object DownloadService {
             .flatMap { dir -> listOfNotNull(dir.absolutePath, StorageUtils.publicInstallRoot(dir)?.absolutePath) }
             .distinct()
 
-        // externalVolumePaths and the base dirs feed SteamService.allInstallPaths
         SteamService.invalidateInstallPathCaches()
     }
 
