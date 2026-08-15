@@ -2805,7 +2805,7 @@ class SteamService : Service(), IChallengeUrlChanged {
                                                 appId = appId,
                                                 clientId = clientId,
                                                 uploadsCompleted = postSyncInfo?.uploadsCompleted == true,
-                                                uploadsRequired = postSyncInfo?.uploadsRequired == false,
+                                                uploadsRequired = postSyncInfo?.uploadsRequired == true,
                                             )
                                         }
                                     }
