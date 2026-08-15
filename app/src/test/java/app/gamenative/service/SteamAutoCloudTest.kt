@@ -3312,6 +3312,70 @@ class SteamAutoCloudTest {
         )
     }
 
+    /**
+     * What becomes of the cloud copies the wide sweep already uploaded. The narrowed sweep no
+     * longer finds them, and a file the cached file list names but the sweep no longer returns is
+     * a local deletion, which the upload batch carries to the cloud as filesToDelete.
+     */
+    @Test
+    fun cachedCacheFilesTheSweepNoLongerFindsAreDeletedFromTheCloud() = runBlocking {
+        installDomeKeeperLayout(domeKeeperPattern)
+
+        // the file list the wide sweep left behind, caches and all
+        val previouslySwept = listOf(
+            "savegame_0.json",
+            "options.txt",
+            "shader_cache/CanvasOcclusion/9f2c/1a4b.vulkan.cache",
+            "vulkan/pipelines.forward_plus.adreno.cache",
+            "logs/godot.log",
+        )
+        db.appFileChangeListsDao().deleteByAppId(steamAppId)
+        db.appFileChangeListsDao().insert(
+            steamAppId,
+            previouslySwept.map { relative ->
+                app.gamenative.data.UserFileInfo(
+                    root = domeKeeperPattern.root,
+                    path = domeKeeperPattern.path,
+                    filename = relative,
+                    timestamp = 0L,
+                    sha = sha1(File(saveFilesDir, relative).readBytes()),
+                )
+            },
+        )
+
+        val response = mock<`in`.dragonbra.javasteam.steam.handlers.steamcloud.AppUploadBatchResponse>()
+        whenever(response.batchID).thenReturn(1L)
+        whenever(response.appChangeNumber).thenReturn(1L)
+        val filesToUpload = mutableListOf<String>()
+        val filesToDelete = mutableListOf<String>()
+        every { mockSteamCloud.beginAppUploadBatch(any(), any(), any(), any(), any(), any(), any()) } answers {
+            @Suppress("UNCHECKED_CAST")
+            filesToUpload += args[2] as List<String>
+            @Suppress("UNCHECKED_CAST")
+            filesToDelete += args[3] as List<String>
+            CompletableFuture.completedFuture(response)
+        }
+
+        val result = runSync()
+
+        assertNotNull(result)
+        listOf(
+            "shader_cache/CanvasOcclusion/9f2c/1a4b.vulkan.cache",
+            "vulkan/pipelines.forward_plus.adreno.cache",
+            "logs/godot.log",
+        ).forEach { relative ->
+            assertTrue(
+                "$relative must be deleted from the cloud, got $filesToDelete",
+                filesToDelete.any { it.endsWith(relative) },
+            )
+        }
+        assertTrue(
+            "the real saves must survive, got $filesToDelete",
+            filesToDelete.none { it.endsWith("savegame_0.json") || it.endsWith("options.txt") },
+        )
+        assertTrue("nothing needs re-uploading, got $filesToUpload", filesToUpload.isEmpty())
+    }
+
     // ── Quota pre-flight ──
     @Test
     fun uploadIsRefusedWhenTheSaveSetExceedsMaxNumFiles() = runBlocking {
