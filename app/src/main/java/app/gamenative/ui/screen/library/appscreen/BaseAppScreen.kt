@@ -154,6 +154,16 @@ internal suspend fun installMissingComponentsForConfig(
     }
 }
 
+/** One snapshot of the per-game probes, so they can be gathered on IO and applied on Main. */
+private data class AppScreenState(
+    val isInstalled: Boolean,
+    val isValidToDownload: Boolean,
+    val isDownloading: Boolean,
+    val downloadProgress: Float,
+    val hasPartialDownload: Boolean,
+    val hasLeftoverInstall: Boolean,
+)
+
 abstract class BaseAppScreen {
     companion object {
         private val installDialogStates = mutableStateMapOf<String, app.gamenative.ui.component.dialog.state.MessageDialogState>()
@@ -1252,14 +1262,28 @@ abstract class BaseAppScreen {
 
         val uiScope = rememberCoroutineScope()
 
+        // These all reach Room, DataStore and the filesystem; on an SD-card install that is
+        // slow enough to ANR, and LaunchedEffect bodies run on the main dispatcher.
         suspend fun performStateRefresh(includeUpdatePending: Boolean) {
-            isInstalledState = isInstalled(context, libraryItem)
-            isValidToDownloadState = isValidToDownload(context, libraryItem)
-            val currentlyDownloading = isDownloading(context, libraryItem)
-            isDownloadingState = currentlyDownloading
-            downloadProgressState = getDownloadProgress(context, libraryItem)
-            hasPartialDownloadState = hasPartialDownload(context, libraryItem)
-            hasLeftoverInstallState = hasLeftoverInstall(context, libraryItem)
+            // Read on IO, assign on Main to respect Compose threading: these probes reach
+            // Room, DataStore and the install roots, and a LaunchedEffect body would
+            // otherwise run them on the main thread.
+            val refreshed = withContext(Dispatchers.IO) {
+                AppScreenState(
+                    isInstalled = isInstalled(context, libraryItem),
+                    isValidToDownload = isValidToDownload(context, libraryItem),
+                    isDownloading = isDownloading(context, libraryItem),
+                    downloadProgress = getDownloadProgress(context, libraryItem),
+                    hasPartialDownload = hasPartialDownload(context, libraryItem),
+                    hasLeftoverInstall = hasLeftoverInstall(context, libraryItem),
+                )
+            }
+            isInstalledState = refreshed.isInstalled
+            isValidToDownloadState = refreshed.isValidToDownload
+            isDownloadingState = refreshed.isDownloading
+            downloadProgressState = refreshed.downloadProgress
+            hasPartialDownloadState = refreshed.hasPartialDownload
+            hasLeftoverInstallState = refreshed.hasLeftoverInstall
             if (includeUpdatePending) {
                 isUpdatePendingState = isUpdatePendingSuspend(context, libraryItem)
             }

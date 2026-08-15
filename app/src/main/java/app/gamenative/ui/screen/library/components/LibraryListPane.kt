@@ -59,9 +59,11 @@ import app.gamenative.ui.theme.PluviaTheme
 import app.gamenative.ui.util.AdaptivePadding
 import app.gamenative.ui.util.WindowWidthClass
 import app.gamenative.ui.util.rememberWindowWidthClass
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.filterNotNull
+import kotlinx.coroutines.withContext
 import timber.log.Timber
 
 /**
@@ -127,8 +129,11 @@ internal fun LibraryListPane(
     val context = LocalContext.current
     val snackBarHost = remember { SnackbarHostState() }
 
-    // Calculate installed count based on current filter state
-    val installedCount = remember(
+    // Calculate installed count based on current filter state. This lists the contents of
+    // every install root and reads several preferences, so it runs off the main thread; the
+    // previous count is kept while a new one is computed so the header never blinks to zero.
+    var installedCount by remember { mutableIntStateOf(0) }
+    LaunchedEffect(
         state.appInfoSortType,
         state.showSteamInLibrary,
         state.showCustomGamesInLibrary,
@@ -137,7 +142,7 @@ internal fun LibraryListPane(
         state.showAmazonInLibrary,
         state.totalAppsInFilter,
     ) {
-        calculateInstalledCount(context, state)
+        installedCount = withContext(Dispatchers.IO) { calculateInstalledCount(context, state) }
     }
 
     val pullToRefreshState = rememberPullToRefreshState()

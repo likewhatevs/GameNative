@@ -27,9 +27,12 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateMapOf
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
@@ -47,6 +50,7 @@ import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import app.gamenative.BuildConfig
 import app.gamenative.R
+import app.gamenative.data.AppInfo
 import app.gamenative.data.DepotInfo
 import app.gamenative.data.ManifestInfo
 import app.gamenative.service.SteamService
@@ -64,6 +68,19 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import kotlin.collections.orEmpty
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+
+/** Everything [GameManagerDialog] needs from Room/DataStore/disk, fetched in one IO pass. */
+private data class GameManagerLoad(
+    val isBaseGameInstalled: Boolean,
+    val installedApp: AppInfo?,
+    val indirectDlcAppIds: List<Int>,
+    val mainAppDlcIdsWithoutProperDepotDlcIds: List<Int>,
+    val availableBytes: Long,
+    val downloadableDepots: Map<Int, DepotInfo>,
+    val dlcInstalled: Map<Int, Boolean>,
+)
 
 data class InstallSizeInfo(
     val downloadSize: String,
@@ -93,34 +110,51 @@ fun GameManagerDialog(
     val displayInfo = onGetDisplayInfo(context)
     val gameId = displayInfo.gameId
 
-    val isBaseGameInstalled = remember(gameId) {
-        SteamService.isAppInstalled(gameId)
-    }
-    val installedApp = remember(gameId, isBaseGameInstalled) {
-        if (isBaseGameInstalled) SteamService.getInstalledApp(gameId) else null
-    }
+    // Every value below walks Room, DataStore and the install roots. Resolving them in
+    // composition blocks the main thread, so they are loaded off it in the effect and the
+    // dialog renders from state — the effect keeps the original evaluation order.
+    var isBaseGameInstalled by remember(gameId) { mutableStateOf(SteamService.peekAppInstalled(gameId) == true) }
+    var installedApp by remember(gameId) { mutableStateOf<AppInfo?>(null) }
     val installedDlcIds = installedApp?.dlcDepots.orEmpty()
+    var indirectDlcAppIds by remember(gameId) { mutableStateOf(emptyList<Int>()) }
+    var mainAppDlcIdsWithoutProperDepotDlcIds by remember(gameId) { mutableStateOf(emptyList<Int>()) }
+    var availableBytes by remember(gameId) { mutableLongStateOf(0L) }
 
-    val indirectDlcAppIds = remember(gameId) {
-        SteamService.getDownloadableDlcAppsOf(gameId).orEmpty().map { it.id }
-    }
-
-    val mainAppDlcIdsWithoutProperDepotDlcIds = remember(gameId) {
-        SteamService.getMainAppDlcIdsWithoutProperDepotDlcIds(gameId).toList()
-    }
-
-    LaunchedEffect(visible) {
+    LaunchedEffect(gameId, visible) {
         scrollState.animateScrollTo(0)
 
         downloadableDepots.clear()
         allDownloadableApps.clear()
 
+        val loaded = withContext(Dispatchers.IO) {
+            val baseInstalled = SteamService.isAppInstalled(gameId)
+            val depots = SteamService.getDownloadableDepots(gameId)
+            GameManagerLoad(
+                isBaseGameInstalled = baseInstalled,
+                installedApp = if (baseInstalled) SteamService.getInstalledApp(gameId) else null,
+                indirectDlcAppIds = SteamService.getDownloadableDlcAppsOf(gameId).orEmpty().map { it.id },
+                mainAppDlcIdsWithoutProperDepotDlcIds =
+                    SteamService.getMainAppDlcIdsWithoutProperDepotDlcIds(gameId).toList(),
+                availableBytes = StorageUtils.getAvailableSpaceForUncreatedPath(SteamService.getAppDirPath(gameId)),
+                downloadableDepots = depots,
+                dlcInstalled = depots.values.map { it.dlcAppId }.distinct()
+                    .associateWith { SteamService.isAppInstalled(it) },
+            )
+        }
+
+        isBaseGameInstalled = loaded.isBaseGameInstalled
+        installedApp = loaded.installedApp
+        indirectDlcAppIds = loaded.indirectDlcAppIds
+        mainAppDlcIdsWithoutProperDepotDlcIds = loaded.mainAppDlcIdsWithoutProperDepotDlcIds
+        availableBytes = loaded.availableBytes
+
+        val loadedInstalledDlcIds = loaded.installedApp?.dlcDepots.orEmpty()
+
         // Get Downloadable Depots
-        val allPossibleDownloadableDepots = SteamService.getDownloadableDepots(gameId)
-        downloadableDepots.putAll(allPossibleDownloadableDepots)
+        downloadableDepots.putAll(loaded.downloadableDepots)
 
         // Get Optional DLC IDs
-        val optionalDlcIds = allPossibleDownloadableDepots
+        val optionalDlcIds = loaded.downloadableDepots
             .filter { it.value.optionalDlcId == it.value.dlcAppId }
             .map { it.value.dlcAppId }
 
@@ -135,13 +169,13 @@ fun GameManagerDialog(
                 .toMap()
             .forEach { (_, depotInfo) ->
                 allDownloadableApps.add(Pair(depotInfo.dlcAppId, depotInfo))
-                val installed = SteamService.isAppInstalled(depotInfo.dlcAppId)
+                val installed = loaded.dlcInstalled[depotInfo.dlcAppId] == true
                 selectedAppIds[depotInfo.dlcAppId] =
                         installed || // For installed Base Game and Indirect DLC App
-                        installedDlcIds.contains(depotInfo.dlcAppId) || // For installed DLC from Main Depot
-                        ( !indirectDlcAppIds.contains(depotInfo.dlcAppId) && !optionalDlcIds.contains(depotInfo.dlcAppId) ) // Not in indirect DLC and not in optional DLC ids
+                        loadedInstalledDlcIds.contains(depotInfo.dlcAppId) || // For installed DLC from Main Depot
+                        ( !loaded.indirectDlcAppIds.contains(depotInfo.dlcAppId) && !optionalDlcIds.contains(depotInfo.dlcAppId) ) // Not in indirect DLC and not in optional DLC ids
 
-                enabledAppIds[depotInfo.dlcAppId] = !installedDlcIds.contains(depotInfo.dlcAppId) && !installed
+                enabledAppIds[depotInfo.dlcAppId] = !loadedInstalledDlcIds.contains(depotInfo.dlcAppId) && !installed
             }
 
         allDownloadableApps.sortBy { it.first }
@@ -210,8 +244,6 @@ fun GameManagerDialog(
     }
 
     fun getInstallSizeInfo(): InstallSizeInfo {
-        val availableBytes = StorageUtils.getAvailableSpaceForUncreatedPath(SteamService.getAppDirPath(gameId))
-
         val baseGameInstallBytes = if (!isBaseGameInstalled) {
             downloadableDepots
                 .filter { (_, depot) ->

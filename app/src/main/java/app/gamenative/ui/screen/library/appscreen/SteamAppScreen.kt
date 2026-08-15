@@ -248,14 +248,24 @@ class SteamAppScreen : BaseAppScreen() {
             appId = libraryItem.appId,
         )
 
+        // Resolving install state walks Room, DataStore and every install root, so it must
+        // not run in composition. Seed from the non-blocking cache (populated by the
+        // library list this screen was opened from) and confirm off the main thread.
         var isInstalled by remember(libraryItem.appId) {
-            mutableStateOf(SteamService.isAppInstalled(gameId))
+            mutableStateOf(SteamService.peekAppInstalled(gameId) == true)
+        }
+        val installStateScope = rememberCoroutineScope()
+
+        LaunchedEffect(gameId) {
+            isInstalled = withContext(Dispatchers.IO) { SteamService.isAppInstalled(gameId) }
         }
 
         DisposableEffect(gameId) {
             val listener: (AndroidEvent.LibraryInstallStatusChanged) -> Unit = { event ->
                 if (event.appId == gameId) {
-                    isInstalled = SteamService.isAppInstalled(gameId)
+                    installStateScope.launch {
+                        isInstalled = withContext(Dispatchers.IO) { SteamService.isAppInstalled(gameId) }
+                    }
                 }
             }
             PluviaApp.events.on<AndroidEvent.LibraryInstallStatusChanged, Unit>(listener)
@@ -278,13 +288,10 @@ class SteamAppScreen : BaseAppScreen() {
             }
         }
 
-        // Get install location
-        val installLocation = remember(isInstalled, gameId) {
-            if (isInstalled) {
-                getAppDirPath(gameId)
-            } else {
-                null
-            }
+        // Get install location (async: resolving the directory can touch every install root)
+        var installLocation by remember(gameId) { mutableStateOf<String?>(null) }
+        LaunchedEffect(isInstalled, gameId) {
+            installLocation = if (isInstalled) withContext(Dispatchers.IO) { getAppDirPath(gameId) } else null
         }
 
         // Get size on disk (async, will update via state)
@@ -313,18 +320,20 @@ class SteamAppScreen : BaseAppScreen() {
             }
         }
 
-        // Get last played text
-        val lastPlayedText = remember(isInstalled, gameId) {
-            if (isInstalled) {
-                val path = getAppDirPath(gameId)
-                val file = File(path)
+        // Get last played text (async: stats the install directory)
+        val neverPlayedText = stringResource(R.string.steam_never)
+        var lastPlayedText by remember(gameId) { mutableStateOf(neverPlayedText) }
+        LaunchedEffect(isInstalled, gameId) {
+            lastPlayedText = withContext(Dispatchers.IO) {
+                if (!isInstalled) {
+                    return@withContext neverPlayedText
+                }
+                val file = File(getAppDirPath(gameId))
                 if (file.exists()) {
                     SteamUtils.fromSteamTime((file.lastModified() / 1000).toInt())
                 } else {
-                    context.getString(R.string.steam_never)
+                    neverPlayedText
                 }
-            } else {
-                context.getString(R.string.steam_never)
             }
         }
 
