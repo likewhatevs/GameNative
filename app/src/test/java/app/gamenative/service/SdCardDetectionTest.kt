@@ -89,53 +89,39 @@ class SdCardDetectionTest {
     }
 
     @Test
-    fun `in-progress install stops the walk instead of probing every root`() {
+    fun `completed install on a later root beats a resumable partial on an earlier one`() {
         val internal = tmpDir.newFolder("internal", "Steam", "steamapps", "common")
         val sdcard = tmpDir.newFolder("sdcard", "Steam", "steamapps", "common")
 
-        val downloading = createGameDir(internal, "MyGame", complete = false)
-        markInProgress(downloading)
-        val untouched = createGameDir(sdcard, "MyGame", complete = false)
+        // a download killed mid-install leaves its marker behind with nothing to clear it;
+        // internal storage is probed first, so this must not shadow the real install
+        markInProgress(createGameDir(internal, "MyGame", complete = false))
+        createGameDir(sdcard, "MyGame", complete = true)
 
-        mockkObject(MarkerUtils)
-        try {
-            val paths = listOf(internal.absolutePath, sdcard.absolutePath)
-            val result = SteamService.resolveExistingAppDir(paths, listOf("MyGame"))
+        val paths = listOf(internal.absolutePath, sdcard.absolutePath)
+        val result = SteamService.resolveExistingAppDir(paths, listOf("MyGame"))
 
-            assertEquals(downloading.absolutePath, result)
-            // the whole point of the marker: roots after the match are never touched
-            verify(exactly = 0) { MarkerUtils.hasMarker(untouched.absolutePath, any()) }
-            verify(exactly = 0) { MarkerUtils.hasResumablePartialInstall(untouched.absolutePath) }
-        } finally {
-            unmockkObject(MarkerUtils)
-        }
+        assertEquals(File(sdcard, "MyGame").absolutePath, result)
     }
 
     @Test
-    fun `persisted byte progress also stops the walk`() {
+    fun `completed install on a later root beats persisted byte progress on an earlier one`() {
         val internal = tmpDir.newFolder("internal", "Steam", "steamapps", "common")
         val sdcard = tmpDir.newFolder("sdcard", "Steam", "steamapps", "common")
 
-        // a download killed between chunks keeps its byte counter but may have lost nothing
-        // else; hasResumablePartialInstall treats that as resumable too
-        val downloading = createGameDir(internal, "MyGame", complete = false)
-        writePersistedProgress(downloading)
-        val untouched = createGameDir(sdcard, "MyGame", complete = false)
+        // the byte counter appears early in any download and no code path removes it on a
+        // kill, so it is an even weaker signal than the marker
+        writePersistedProgress(createGameDir(internal, "MyGame", complete = false))
+        createGameDir(sdcard, "MyGame", complete = true)
 
-        mockkObject(MarkerUtils)
-        try {
-            val paths = listOf(internal.absolutePath, sdcard.absolutePath)
-            val result = SteamService.resolveExistingAppDir(paths, listOf("MyGame"))
+        val paths = listOf(internal.absolutePath, sdcard.absolutePath)
+        val result = SteamService.resolveExistingAppDir(paths, listOf("MyGame"))
 
-            assertEquals(downloading.absolutePath, result)
-            verify(exactly = 0) { MarkerUtils.hasResumablePartialInstall(untouched.absolutePath) }
-        } finally {
-            unmockkObject(MarkerUtils)
-        }
+        assertEquals(File(sdcard, "MyGame").absolutePath, result)
     }
 
     @Test
-    fun `completed install beats an in-progress install found later in the walk`() {
+    fun `completed install beats a resumable partial found earlier in the walk`() {
         val internal = tmpDir.newFolder("internal", "Steam", "steamapps", "common")
         val sdcard = tmpDir.newFolder("sdcard", "Steam", "steamapps", "common")
 
@@ -146,6 +132,57 @@ class SdCardDetectionTest {
         val result = SteamService.resolveExistingAppDir(paths, listOf("MyGame"))
 
         assertEquals(File(internal, "MyGame").absolutePath, result)
+    }
+
+    @Test
+    fun `resumable partial beats a bare leftover directory found earlier`() {
+        val internal = tmpDir.newFolder("internal", "Steam", "steamapps", "common")
+        val sdcard = tmpDir.newFolder("sdcard", "Steam", "steamapps", "common")
+
+        createGameDir(internal, "MyGame", complete = false)
+        val resumable = createGameDir(sdcard, "MyGame", complete = false)
+        markInProgress(resumable)
+
+        val paths = listOf(internal.absolutePath, sdcard.absolutePath)
+        val result = SteamService.resolveExistingAppDir(paths, listOf("MyGame"))
+
+        assertEquals(resumable.absolutePath, result)
+    }
+
+    @Test
+    fun `persisted byte progress counts as resumable`() {
+        val internal = tmpDir.newFolder("internal", "Steam", "steamapps", "common")
+        val sdcard = tmpDir.newFolder("sdcard", "Steam", "steamapps", "common")
+
+        createGameDir(internal, "MyGame", complete = false)
+        val resumable = createGameDir(sdcard, "MyGame", complete = false)
+        writePersistedProgress(resumable)
+
+        val paths = listOf(internal.absolutePath, sdcard.absolutePath)
+        val result = SteamService.resolveExistingAppDir(paths, listOf("MyGame"))
+
+        assertEquals(resumable.absolutePath, result)
+    }
+
+    @Test
+    fun `completion marker is the only early exit`() {
+        val internal = tmpDir.newFolder("internal", "Steam", "steamapps", "common")
+        val sdcard = tmpDir.newFolder("sdcard", "Steam", "steamapps", "common")
+
+        markInProgress(createGameDir(internal, "MyGame", complete = false))
+        val later = createGameDir(sdcard, "MyGame", complete = false)
+
+        mockkObject(MarkerUtils)
+        try {
+            val paths = listOf(internal.absolutePath, sdcard.absolutePath)
+            SteamService.resolveExistingAppDir(paths, listOf("MyGame"))
+
+            // a partial match must not stop the walk, or a completed install sitting on a
+            // later root would never be seen
+            verify { MarkerUtils.hasMarker(later.absolutePath, Marker.DOWNLOAD_COMPLETE_MARKER) }
+        } finally {
+            unmockkObject(MarkerUtils)
+        }
     }
 
     @Test
