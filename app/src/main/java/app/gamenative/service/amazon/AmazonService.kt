@@ -18,6 +18,7 @@ import app.gamenative.service.NotificationHelper
 import app.gamenative.utils.ContainerUtils
 import app.gamenative.utils.ExecutableSelectionUtils
 import app.gamenative.utils.MarkerUtils
+import com.winlator.container.Container
 import dagger.hilt.EntryPoint
 import dagger.hilt.InstallIn
 import dagger.hilt.android.AndroidEntryPoint
@@ -332,10 +333,13 @@ class AmazonService : Service() {
         }
 
         /**
-         * Resolves the effective launch executable for an Amazon game.
+         * Resolves the effective launch executable for an Amazon game (container config or
+         * auto-detected).
          * Returns empty string if no executable can be found.
          */
-        fun getLaunchExecutable(containerId: String): String {
+        fun getLaunchExecutable(containerId: String, container: Container): String {
+            if (container.executablePath.isNotEmpty()) return container.executablePath
+
             val appId = runCatching { ContainerUtils.extractGameIdFromContainerId(containerId) }.getOrElse { return "" }
             if (appId <= 0) return ""
 

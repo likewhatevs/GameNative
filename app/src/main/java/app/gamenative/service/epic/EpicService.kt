@@ -383,18 +383,21 @@ class EpicService : Service() {
         }
 
         /**
-         * Resolves the effective launch executable for an Epic game.
+         * Resolves the effective launch executable for an Epic game (container config or
+         * auto-detected).
          * Container id is expected to be "EPIC_&lt;numericId&gt;" (from library). Returns empty if
          * game is not installed, no executable can be found, or containerId cannot be parsed.
          */
-        suspend fun getLaunchExecutable(containerId: String): String {
+        suspend fun getLaunchExecutable(containerId: String, container: Container): String {
             val gameId = try {
                 ContainerUtils.extractGameIdFromContainerId(containerId)
             } catch (e: Exception) {
                 Timber.tag("Epic").e(e, "Failed to parse Epic containerId: $containerId")
                 return ""
             }
-            return getInstance()?.epicManager?.getLaunchExecutable(gameId) ?: ""
+            return container.executablePath.ifEmpty {
+                getInstance()?.epicManager?.getLaunchExecutable(gameId) ?: ""
+            }
         }
 
         suspend fun refreshLibrary(context: Context): Result<Int> {
