@@ -100,6 +100,12 @@ class PluviaApp : SplitCompatApplication() {
         // them asynchronously would let an early reader build a path rooted at "".
         DownloadService.populateDownloadService(this)
 
+        // Creates a directory and a .nomedia file on the install volume, which on an SD card
+        // are FUSE writes — too slow to do while the main thread is starting the process.
+        appScope.launch {
+            DownloadService.migrateExternalStoragePath()
+        }
+
         // One-shot directory rename plus a Room rewrite. Nothing reads GOG/Amazon install
         // paths until those libraries are opened, which needs an Activity and a login, so it
         // does not have to hold up process start.
