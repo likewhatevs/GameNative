@@ -7,7 +7,7 @@ import app.gamenative.R
 import app.gamenative.data.SaveFilePattern
 import app.gamenative.enums.PathType
 import app.gamenative.service.SteamService
-import app.gamenative.utils.FileUtils
+import app.gamenative.utils.SteamSaveSweep
 import com.winlator.container.Container
 import java.io.IOException
 import java.nio.channels.Channels
@@ -213,7 +213,7 @@ object SteamSaveTransfer {
             val userDataPath = Paths.get(userDataRoot)
             val userDataFiles = findPatternFiles(
                 userDataPath,
-                SaveFilePattern(root = PathType.SteamUserData, path = "", pattern = "*", recursive = 5),
+                SaveFilePattern(root = PathType.SteamUserData, path = "", pattern = "*", recursive = 1),
             )
             if (userDataFiles.isNotEmpty()) {
                 result += ResolvedSaveRoot(
@@ -259,16 +259,16 @@ object SteamSaveTransfer {
         }
     }
 
-    private fun findPatternFiles(basePath: Path, pattern: SaveFilePattern): List<Path> {
+    internal fun findPatternFiles(basePath: Path, pattern: SaveFilePattern): List<Path> {
         if (!Files.exists(basePath)) return emptyList()
-        val depth = if (pattern.recursive > 0) pattern.recursive else 5
-        return FileUtils.findFilesRecursive(
-            rootPath = basePath,
+        // `recursive` is a boolean, not a depth: a rule that omits it covers only the immediate
+        // children of its directory. Same selection as the cloud sync, so an export holds the
+        // files the cloud would.
+        return SteamSaveSweep.findSaveFiles(
+            basePath = basePath,
             pattern = pattern.pattern,
-            maxDepth = depth,
-        )
-            .filter { Files.isRegularFile(it) }
-            .collect(Collectors.toList())
+            recursive = pattern.recursive != 0,
+        ).filter { Files.isRegularFile(it) }
     }
 
     private fun patternRootId(pattern: SaveFilePattern): String {

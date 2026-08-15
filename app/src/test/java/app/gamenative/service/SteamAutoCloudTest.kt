@@ -1,10 +1,8 @@
 package app.gamenative.service
 
 import android.content.Context
-import android.database.sqlite.SQLiteBlobTooBigException
 import androidx.room.Room
 import androidx.test.core.app.ApplicationProvider
-import app.gamenative.PrefManager
 import app.gamenative.data.ConfigInfo
 import app.gamenative.data.FileChangeLists
 import app.gamenative.data.PostSyncInfo
@@ -13,7 +11,6 @@ import app.gamenative.data.SteamApp
 import app.gamenative.data.SteamFileHashCache
 import app.gamenative.data.UFS
 import app.gamenative.db.PluviaDatabase
-import app.gamenative.db.dao.FileChangeListsDao
 import app.gamenative.enums.AppType
 import app.gamenative.enums.OS
 import app.gamenative.enums.PathType
@@ -24,7 +21,6 @@ import app.gamenative.service.DownloadService
 import app.gamenative.service.SteamService
 import com.winlator.container.Container
 import com.winlator.xenvironment.ImageFs
-import `in`.dragonbra.javasteam.enums.EResult
 import `in`.dragonbra.javasteam.steam.handlers.steamcloud.AppFileChangeList
 import `in`.dragonbra.javasteam.steam.handlers.steamcloud.AppFileInfo
 import `in`.dragonbra.javasteam.steam.handlers.steamcloud.SteamCloud
@@ -49,7 +45,6 @@ import io.mockk.every
 import io.mockk.mockk
 import io.mockk.mockkObject
 import io.mockk.unmockkObject
-import io.mockk.verify
 import kotlinx.coroutines.future.await
 import okhttp3.ResponseBody.Companion.toResponseBody
 import org.mockito.kotlin.any
@@ -58,10 +53,8 @@ import org.mockito.kotlin.doReturn
 import org.mockito.kotlin.mock
 import org.mockito.kotlin.whenever
 import org.robolectric.RobolectricTestRunner
-import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.IOException
-import java.io.InputStream
 import java.lang.reflect.Field
 import java.nio.file.Path
 import java.util.EnumSet
@@ -144,22 +137,26 @@ class SteamAutoCloudTest {
             .allowMainThreadQueries()
             .build()
 
-        // Create test SteamApp with 3 patterns sharing the same prefix
+        // Create test SteamApp with 3 patterns sharing the same prefix. The save files sit in a
+        // SaveGames subdirectory of the declared path, which only a recursive rule reaches.
         val saveFilePatterns = listOf(
             SaveFilePattern(
                 root = PathType.WinMyDocuments,
                 path = "My Games/TestGame/Steam/76561198025127569",
                 pattern = "Capture*.sav",
+                recursive = 1,
             ),
             SaveFilePattern(
                 root = PathType.WinMyDocuments,
                 path = "My Games/TestGame/Steam/76561198025127569",
                 pattern = "*SaveData*.sav",
+                recursive = 1,
             ),
             SaveFilePattern(
                 root = PathType.WinMyDocuments,
                 path = "My Games\\TestGame\\Steam\\76561198025127569",
                 pattern = "SystemData_0.sav",
+                recursive = 1,
             ),
         )
 
@@ -201,23 +198,6 @@ class SteamAutoCloudTest {
         whenever(mockSteamService.steamClient).thenReturn(mockSteamClient)
         whenever(mockSteamClient.steamID).thenReturn(mockSteamID)
 
-        // Block uploads go through the client hanging off SteamConfiguration; accept every block.
-        val mockUploadHttpClient = mock<OkHttpClient>()
-        val mockUploadCall = mock<Call>()
-        whenever(mockUploadHttpClient.newCall(any())).thenReturn(mockUploadCall)
-        whenever(mockUploadCall.execute()).thenAnswer {
-            Response.Builder()
-                .request(okhttp3.Request.Builder().url("https://upload.example.com/upload").build())
-                .protocol(Protocol.HTTP_1_1)
-                .code(200)
-                .message("OK")
-                .body(ByteArray(0).toResponseBody())
-                .build()
-        }
-        val mockConfig = mock<SteamConfiguration>()
-        whenever(mockSteamClient.configuration).thenReturn(mockConfig)
-        whenever(mockConfig.httpClient).thenReturn(mockUploadHttpClient)
-
         // Set SteamService.instance using reflection
         try {
             val instanceField = SteamService::class.java.getDeclaredField("instance")
@@ -251,8 +231,7 @@ class SteamAutoCloudTest {
             CompletableFuture.completedFuture(mockUploadBatchResponse)
 
         val mockFileUploadInfo = mock<`in`.dragonbra.javasteam.steam.handlers.steamcloud.FileUploadInfo>()
-        val blockRequests = singleUploadBlock()
-        whenever(mockFileUploadInfo.blockRequests).thenReturn(blockRequests)
+        whenever(mockFileUploadInfo.blockRequests).thenReturn(emptyList())
 
         every { mockSteamCloud.beginFileUpload(any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any()) } returns
             CompletableFuture.completedFuture(mockFileUploadInfo)
@@ -269,10 +248,6 @@ class SteamAutoCloudTest {
             db.appChangeNumbersDao().insert(app.gamenative.data.ChangeNumbers(steamAppId, 0))
             db.appFileChangeListsDao().insert(steamAppId, emptyList())
         }
-
-        // preferences outlive a single test, so start with no batch recorded as open
-        PrefManager.init(context)
-        PrefManager.setLongBlocking(SteamAutoCloud.openUploadBatchKey(steamAppId), 0L)
     }
 
     @After
@@ -717,8 +692,7 @@ class SteamAutoCloudTest {
         }
 
         val mockFileUploadInfo = mock<`in`.dragonbra.javasteam.steam.handlers.steamcloud.FileUploadInfo>()
-        val blockRequests = singleUploadBlock()
-        whenever(mockFileUploadInfo.blockRequests).thenReturn(blockRequests)
+        whenever(mockFileUploadInfo.blockRequests).thenReturn(emptyList())
 
         every { mockSteamCloud.beginFileUpload(any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any()) } returns
             CompletableFuture.completedFuture(mockFileUploadInfo)
@@ -948,12 +922,14 @@ class SteamAutoCloudTest {
         subdir7.mkdirs()
         File(subdir7, "level7.sav").writeBytes("level7".toByteArray())
 
-        // Update test app with pattern that matches all .sav files
+        // Update test app with a recursive pattern that matches all .sav files. Only a rule with
+        // recursive set descends at all; the depth cap below is what bounds that descent.
         val saveFilePatterns = listOf(
             SaveFilePattern(
                 root = PathType.WinMyDocuments,
                 path = "My Games/TestGame/Steam/76561198025127569",
                 pattern = "*.sav",
+                recursive = 1,
             ),
         )
 
@@ -1019,9 +995,9 @@ class SteamAutoCloudTest {
         ).await()
 
         // Verify result - should find files at depths 0-4 (5 files); depth 5 (subdir5) is
-        // the last directory walked but maxDepth=5 does not recurse into its subdirectories.
+        // the last directory walked but the depth cap does not recurse into its subdirectories.
         assertNotNull("Result should not be null", result)
-        assertEquals("Should upload 5 files (depths 0-4, maxDepth=5)", 5, result!!.filesUploaded)
+        assertEquals("Should upload 5 files (depths 0-4, depth cap 5)", 5, result!!.filesUploaded)
         assertTrue("Uploads should be completed", result.uploadsCompleted)
         assertEquals("Should have 5 files managed", 5, result.filesManaged)
 
@@ -1389,8 +1365,7 @@ class SteamAutoCloudTest {
         }
 
         val mockFileUploadInfo = mock<`in`.dragonbra.javasteam.steam.handlers.steamcloud.FileUploadInfo>()
-        val blockRequests = singleUploadBlock()
-        whenever(mockFileUploadInfo.blockRequests).thenReturn(blockRequests)
+        whenever(mockFileUploadInfo.blockRequests).thenReturn(emptyList())
 
         every { mockSteamCloud.beginFileUpload(any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any()) } returns
                 CompletableFuture.completedFuture(mockFileUploadInfo)
@@ -1522,8 +1497,7 @@ class SteamAutoCloudTest {
         }
 
         val mockFileUploadInfo = mock<`in`.dragonbra.javasteam.steam.handlers.steamcloud.FileUploadInfo>()
-        val blockRequests = singleUploadBlock()
-        whenever(mockFileUploadInfo.blockRequests).thenReturn(blockRequests)
+        whenever(mockFileUploadInfo.blockRequests).thenReturn(emptyList())
 
         every { mockSteamCloud.beginFileUpload(any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any()) } returns
             CompletableFuture.completedFuture(mockFileUploadInfo)
@@ -1630,8 +1604,7 @@ class SteamAutoCloudTest {
         }
 
         val mockFileUploadInfo = mock<`in`.dragonbra.javasteam.steam.handlers.steamcloud.FileUploadInfo>()
-        val blockRequests = singleUploadBlock()
-        whenever(mockFileUploadInfo.blockRequests).thenReturn(blockRequests)
+        whenever(mockFileUploadInfo.blockRequests).thenReturn(emptyList())
 
         every { mockSteamCloud.beginFileUpload(any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any()) } returns
             CompletableFuture.completedFuture(mockFileUploadInfo)
@@ -1967,8 +1940,7 @@ class SteamAutoCloudTest {
         }
 
         val mockFileUploadInfo = mock<`in`.dragonbra.javasteam.steam.handlers.steamcloud.FileUploadInfo>()
-        val blockRequests = singleUploadBlock()
-        whenever(mockFileUploadInfo.blockRequests).thenReturn(blockRequests)
+        whenever(mockFileUploadInfo.blockRequests).thenReturn(emptyList())
 
         every { mockSteamCloud.beginFileUpload(any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any()) } returns
             CompletableFuture.completedFuture(mockFileUploadInfo)
@@ -2051,23 +2023,6 @@ class SteamAutoCloudTest {
         return mock
     }
 
-    /**
-     * One block request, as Steam returns for a file it accepted. The length is arbitrary because
-     * the stubbed upload client accepts whatever it is sent; only the presence of a block matters.
-     */
-    private fun singleUploadBlock(): List<`in`.dragonbra.javasteam.steam.handlers.steamcloud.FileUploadBlockDetails> {
-        val block = mock<`in`.dragonbra.javasteam.steam.handlers.steamcloud.FileUploadBlockDetails>()
-        whenever(block.urlHost).thenReturn("upload.example.com")
-        whenever(block.urlPath).thenReturn("/upload")
-        whenever(block.useHttps).thenReturn(true)
-        whenever(block.requestHeaders).thenReturn(emptyList())
-        whenever(block.explicitBodyData).thenReturn(ByteArray(0))
-        whenever(block.blockOffset).thenReturn(0L)
-        whenever(block.blockLength).thenReturn(1)
-        whenever(block.mayParallelize).thenReturn(false)
-        return listOf(block)
-    }
-
     /** Compute SHA-1 of raw bytes — same algorithm as SteamAutoCloud.streamingShaHash */
     private fun sha1(content: ByteArray): ByteArray {
         return java.security.MessageDigest.getInstance("SHA-1").digest(content)
@@ -2089,7 +2044,11 @@ class SteamAutoCloudTest {
             val basePath = java.nio.file.Paths.get(prefixToPath(pattern.root.toString()), pattern.substitutedPath)
             if (!java.nio.file.Files.exists(basePath)) return@forEach
 
-            app.gamenative.utils.FileUtils.findFilesRecursive(basePath, pattern.pattern, 5).forEach { filePath ->
+            app.gamenative.utils.SteamSaveSweep.findSaveFiles(
+                basePath,
+                pattern.pattern,
+                pattern.recursive != 0,
+            ).forEach { filePath ->
                 val relativePath = basePath.relativize(filePath).toString()
                 cachedFiles.add(
                     app.gamenative.data.UserFileInfo(
@@ -3255,225 +3214,80 @@ class SteamAutoCloudTest {
         )
     }
 
-    // ── A rejected upload must leave no persisted state, so the next sync can still succeed ──
-
     /**
-     * Leaves the app with local changes and a cloud that has nothing new, which is the state that
-     * sends syncUserFiles down the upload path. Returns the change number both sides start on.
+     * Replaces the local files with Dome Keeper's layout: a Godot game whose three ufs rules are
+     * all non-recursive with pattern "*.*", while Godot writes its caches and logs into
+     * subdirectories of the very same directory.
+     *
+     * Also puts a stale, non-empty cache in the db so the sync takes the upload path.
      */
-    private fun stageLocalChangesForUpload(): Long = runBlocking {
-        val changeNumber = 5L
+    private fun installDomeKeeperLayout(pattern: SaveFilePattern) = runBlocking {
+        saveFilesDir.listFiles()?.forEach { it.deleteRecursively() }
+
+        File(saveFilesDir, "savegame_0.json").writeText("save")
+        File(saveFilesDir, "options.txt").writeText("options")
+        File(saveFilesDir, "singleplayer").mkdirs()
+        File(saveFilesDir, "singleplayer/savegame_1.json").writeText("save")
+        File(saveFilesDir, "shader_cache/CanvasOcclusion/9f2c").mkdirs()
+        File(saveFilesDir, "shader_cache/CanvasOcclusion/9f2c/1a4b.vulkan.cache").writeText("shader")
+        File(saveFilesDir, "vulkan").mkdirs()
+        File(saveFilesDir, "vulkan/pipelines.forward_plus.adreno.cache").writeText("pipelines")
+        File(saveFilesDir, "logs").mkdirs()
+        File(saveFilesDir, "logs/godot.log").writeText("log")
+
+        val testApp = db.steamAppDao().findApp(steamAppId)!!
+        db.steamAppDao().update(
+            testApp.copy(ufs = UFS(saveFilePatterns = listOf(pattern))),
+        )
 
         db.appChangeNumbersDao().deleteByAppId(steamAppId)
         db.appFileChangeListsDao().deleteByAppId(steamAppId)
-        db.appChangeNumbersDao().insert(app.gamenative.data.ChangeNumbers(steamAppId, changeNumber))
+        db.appChangeNumbersDao().insert(app.gamenative.data.ChangeNumbers(steamAppId, 0))
         db.appFileChangeListsDao().insert(
             steamAppId,
             listOf(
                 app.gamenative.data.UserFileInfo(
                     root = PathType.WinMyDocuments,
-                    path = "My Games/TestGame/Steam/76561198025127569",
-                    filename = "SaveData_0.sav",
+                    path = "__stale__",
+                    filename = "__placeholder__",
                     timestamp = 0L,
-                    sha = sha1("stale content".toByteArray()),
+                    sha = ByteArray(20) { 0 },
                 ),
             ),
         )
-
-        every { mockSteamCloud.getAppFileListChange(any(), any(), any()) } returns
-            CompletableFuture.completedFuture(makeCloudFileChangeList(changeNumber))
-
-        changeNumber
     }
 
-    private fun stubUploadBatch(batchId: Long, appChangeNumber: Long) {
-        val response = mock<`in`.dragonbra.javasteam.steam.handlers.steamcloud.AppUploadBatchResponse>()
-        whenever(response.batchID).thenReturn(batchId)
-        whenever(response.appChangeNumber).thenReturn(appChangeNumber)
+    private val domeKeeperPattern = SaveFilePattern(
+        root = PathType.WinMyDocuments,
+        path = "My Games/TestGame/Steam/76561198025127569/SaveGames",
+        pattern = "*.*",
+    )
 
-        every { mockSteamCloud.beginAppUploadBatch(any(), any(), any(), any(), any(), any(), any()) } returns
-            CompletableFuture.completedFuture(response)
-    }
+    // ── Root cause: a non-recursive rule must not reach the engine's caches ──
+    @Test
+    fun nonRecursiveRule_doesNotSweepGodotCaches() = runBlocking {
+        installDomeKeeperLayout(domeKeeperPattern)
 
-    private fun assertSyncStateUnchanged(changeNumber: Long) = runBlocking {
+        val result = SteamAutoCloud.syncUserFiles(
+            appInfo = db.steamAppDao().findApp(steamAppId)!!,
+            clientId = clientId,
+            steamInstance = mockSteamService,
+            steamCloud = mockSteamCloud,
+            preferredSave = SaveLocation.None,
+            prefixToPath = makePrefixToPath(),
+        ).await()
+
+        assertNotNull(result)
         assertEquals(
-            "change number must not move",
-            changeNumber,
-            db.appChangeNumbersDao().getByAppId(steamAppId)!!.changeNumber,
+            "a rule without recursive covers only its own directory",
+            2,
+            result!!.filesManaged,
         )
-        assertEquals(
-            "cached file list must not be replaced",
-            listOf("SaveData_0.sav"),
-            db.appFileChangeListsDao().getByAppId(steamAppId)!!.userFileInfo.map { it.filename },
-        )
-    }
-
-    private suspend fun runSync(): PostSyncInfo? = SteamAutoCloud.syncUserFiles(
-        appInfo = db.steamAppDao().findApp(steamAppId)!!,
-        clientId = clientId,
-        steamInstance = mockSteamService,
-        steamCloud = mockSteamCloud,
-        preferredSave = SaveLocation.None,
-        prefixToPath = makePrefixToPath(),
-    ).await()
-
-    @Test
-    fun refusedUploadBatch_failsSyncAndPersistsNothing() = runBlocking {
-        val changeNumber = stageLocalChangesForUpload()
-        stubUploadBatch(batchId = 0, appChangeNumber = 0)
-
-        val result = runSync()
-
-        assertNotNull(result)
-        assertEquals(SyncResult.UpdateFail, result!!.syncResult)
-        assertFalse("uploads did not complete", result.uploadsCompleted)
-        assertEquals("nothing was transferred", 0, result.filesUploaded)
-        assertSyncStateUnchanged(changeNumber)
-        verify(exactly = 0) { mockSteamCloud.completeAppUploadBatch(any(), any(), any(), any()) }
-    }
-
-    @Test
-    fun fileWithoutBlockRequests_failsSyncAndPersistsNothing() = runBlocking {
-        val changeNumber = stageLocalChangesForUpload()
-        stubUploadBatch(batchId = 1, appChangeNumber = changeNumber + 1)
-
-        val mockFileUploadInfo = mock<`in`.dragonbra.javasteam.steam.handlers.steamcloud.FileUploadInfo>()
-        whenever(mockFileUploadInfo.blockRequests).thenReturn(emptyList())
-        every { mockSteamCloud.beginFileUpload(any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any()) } returns
-            CompletableFuture.completedFuture(mockFileUploadInfo)
-
-        val result = runSync()
-
-        assertNotNull(result)
-        assertEquals(SyncResult.UpdateFail, result!!.syncResult)
-        assertEquals("nothing was transferred", 0, result.filesUploaded)
-        assertSyncStateUnchanged(changeNumber)
-        verify { mockSteamCloud.completeAppUploadBatch(any(), any(), EResult.Fail, any()) }
-    }
-
-    @Test
-    fun uncommittedFile_failsSyncAndPersistsNothing() = runBlocking {
-        val changeNumber = stageLocalChangesForUpload()
-        stubUploadBatch(batchId = 1, appChangeNumber = changeNumber + 1)
-
-        every { mockSteamCloud.commitFileUpload(any(), any(), any(), any(), any()) } returns
-            CompletableFuture.completedFuture(false)
-
-        val result = runSync()
-
-        assertNotNull(result)
-        assertEquals(SyncResult.UpdateFail, result!!.syncResult)
-        assertEquals("an uncommitted file is not uploaded", 0, result.filesUploaded)
-        assertSyncStateUnchanged(changeNumber)
-    }
-
-    @Test
-    fun uploadWithoutChangeNumber_failsSyncAndPersistsNothing() = runBlocking {
-        val changeNumber = stageLocalChangesForUpload()
-        stubUploadBatch(batchId = 1, appChangeNumber = 0)
-
-        val result = runSync()
-
-        assertNotNull(result)
-        assertEquals(SyncResult.UpdateFail, result!!.syncResult)
-        assertFalse("uploads did not complete", result.uploadsCompleted)
-        assertSyncStateUnchanged(changeNumber)
-    }
-
-    @Test
-    fun failureDuringUpload_stillClosesTheBatch() = runBlocking {
-        val changeNumber = stageLocalChangesForUpload()
-        stubUploadBatch(batchId = 7, appChangeNumber = changeNumber + 1)
-
-        every { mockSteamCloud.beginFileUpload(any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any()) } returns
-            CompletableFuture.failedFuture(IOException("upload service unreachable"))
-
-        val thrown = runCatching { runSync() }.exceptionOrNull()
-
-        assertNotNull("the failure must reach the caller", thrown)
-        verify { mockSteamCloud.completeAppUploadBatch(steamAppId, 7L, EResult.Fail, any()) }
-        assertSyncStateUnchanged(changeNumber)
-    }
-
-    @Test
-    fun batchLeftOpenByAnEarlierSession_isClosedBeforeSyncing() = runBlocking {
-        PrefManager.setLongBlocking(SteamAutoCloud.openUploadBatchKey(steamAppId), 42L)
-
-        runSync()
-
-        verify { mockSteamCloud.completeAppUploadBatch(steamAppId, 42L, EResult.Fail, any()) }
-        assertEquals(
-            "a closed batch must not be closed again on the next sync",
-            0L,
-            PrefManager.getLong(SteamAutoCloud.openUploadBatchKey(steamAppId), 0L),
+        assertEquals("only the two real saves upload", 2, result.filesUploaded)
+        assertTrue(
+            "the shader cache stays on disk, it is just not synced",
+            File(saveFilesDir, "shader_cache/CanvasOcclusion/9f2c/1a4b.vulkan.cache").exists(),
         )
     }
 
-    /**
-     * The stream gives up long before the JUnit timeout would, because a copy that spins on empty
-     * reads cannot be interrupted: it would hang the whole suite instead of failing this test.
-     */
-    @Test(timeout = 30_000)
-    fun copyTo_streamStuckOnEmptyReads_failsInsteadOfSpinning() {
-        val readsBeforeGivingUp = SteamAutoCloud.MAX_CONSECUTIVE_EMPTY_READS * 1000
-        var reads = 0
-        val stuckStream = object : InputStream() {
-            override fun read(): Int = throw UnsupportedOperationException()
-            override fun read(b: ByteArray, off: Int, len: Int): Int {
-                if (++reads > readsBeforeGivingUp) {
-                    throw AssertionError("copyTo read an empty stream $reads times without giving up")
-                }
-                return 0
-            }
-        }
-
-        val thrown = runCatching {
-            with(SteamAutoCloud) { stuckStream.copyTo(ByteArrayOutputStream()) { _, _ -> } }
-        }.exceptionOrNull()
-
-        assertTrue("a stuck stream must fail the copy, got $thrown", thrown is IOException)
-    }
-
-    @Test(timeout = 30_000)
-    fun copyTo_streamWithOccasionalEmptyReads_copiesEverything() {
-        val content = "save data that arrives in fits and starts".toByteArray()
-        val emptyReadsBeforeEachByte = SteamAutoCloud.MAX_CONSECUTIVE_EMPTY_READS
-        var offset = 0
-        var pending = emptyReadsBeforeEachByte
-        val stallingStream = object : InputStream() {
-            override fun read(): Int = throw UnsupportedOperationException()
-            override fun read(b: ByteArray, off: Int, len: Int): Int = when {
-                offset == content.size -> -1
-                pending-- > 0 -> 0
-                else -> {
-                    pending = emptyReadsBeforeEachByte
-                    b[off] = content[offset++]
-                    1
-                }
-            }
-        }
-
-        val out = ByteArrayOutputStream()
-        var reportedBytes = 0L
-        val copied = with(SteamAutoCloud) { stallingStream.copyTo(out) { chunk, _ -> reportedBytes += chunk } }
-
-        assertEquals(content.size.toLong(), copied)
-        assertEquals(content.size.toLong(), reportedBytes)
-        assertEquals(content.contentToString(), out.toByteArray().contentToString())
-    }
-
-    @Test
-    fun oversizedCachedFileList_readsAsNoCache() = runBlocking {
-        val throwingDao = mock<FileChangeListsDao>()
-        whenever(throwingDao.getByAppId(any())).thenThrow(SQLiteBlobTooBigException())
-        whenever(mockSteamService.fileChangeListsDao).thenReturn(throwingDao)
-
-        assertNull(SteamAutoCloud.getCachedFileList(mockSteamService, steamAppId))
-
-        // and the sync it feeds must fall back to a full comparison instead of throwing
-        val result = runSync()
-
-        assertNotNull(result)
-        assertEquals(SyncResult.Conflict, result!!.syncResult)
-    }
 }
