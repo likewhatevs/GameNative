@@ -138,6 +138,7 @@ class AmazonDownloadManager @Inject constructor(
                 val failure = results.firstOrNull { it.isFailure }
                 if (failure != null) {
                     MarkerUtils.removeMarker(installPath, Marker.DOWNLOAD_IN_PROGRESS_MARKER)
+                    downloadInfo.persistProgressSnapshot(force = true)
                     return@withContext Result.failure(
                         failure.exceptionOrNull() ?: Exception("File download failed")
                     )
@@ -181,12 +182,13 @@ class AmazonDownloadManager @Inject constructor(
         } catch (e: Exception) {
             if (e is CancellationException) {
                 MarkerUtils.removeMarker(installPath, Marker.DOWNLOAD_IN_PROGRESS_MARKER)
-                downloadInfo.persistProgressSnapshot()
+                downloadInfo.persistProgressSnapshot(force = true)
                 downloadInfo.setActive(false)
                 throw e
             }
             Timber.tag(TAG).e(e, "Download failed for ${game.title}: ${e.message}")
             MarkerUtils.removeMarker(installPath, Marker.DOWNLOAD_IN_PROGRESS_MARKER)
+            downloadInfo.persistProgressSnapshot(force = true)
             downloadInfo.updateStatusMessage("Failed: ${e.message}")
             downloadInfo.setProgress(-1f)
             downloadInfo.setActive(false)

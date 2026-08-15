@@ -2186,7 +2186,7 @@ class SteamService : Service(), IChallengeUrlChanged {
                         throw e
                     } catch (e: Exception) {
                         Timber.e(e, "Download failed for app $appId")
-                        di.persistProgressSnapshot()
+                        di.persistProgressSnapshot(force = true)
                         // Mark all depots as failed
                         selectedDepots.keys.sorted().forEachIndexed { idx, _ ->
                             di.setWeight(idx, 0)
@@ -2376,7 +2376,7 @@ class SteamService : Service(), IChallengeUrlChanged {
                     downloadInfo.setProgress(depotPercentComplete, index)
                 }
 
-                // Persist progress snapshot
+                // Persist progress snapshot (throttled — this runs per chunk)
                 downloadInfo.persistProgressSnapshot()
             }
 
@@ -2395,8 +2395,8 @@ class SteamService : Service(), IChallengeUrlChanged {
                     downloadInfo.setProgress(1f, index)
                 }
 
-                // Persist progress snapshot
-                downloadInfo.persistProgressSnapshot()
+                // Persist progress snapshot — depot boundary, keep it exact
+                downloadInfo.persistProgressSnapshot(force = true)
             }
         }
 
@@ -3643,7 +3643,7 @@ class SteamService : Service(), IChallengeUrlChanged {
         // Persist download progress for all active downloads
         // This is a safety net for OS kills (unlikely but possible)
         downloadJobs.values.forEach { downloadInfo ->
-            downloadInfo.persistProgressSnapshot()
+            downloadInfo.persistProgressSnapshot(force = true)
         }
 
         stopForeground(STOP_FOREGROUND_REMOVE)
