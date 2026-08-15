@@ -656,6 +656,9 @@ object CustomGameScanner {
                         }
 
                         MarkerUtils.addMarker(folderPath, Marker.DOWNLOAD_COMPLETE_MARKER)
+
+                        // the app now resolves through customInstallPath instead of the scan
+                        SteamService.invalidateAppDirCache(steamApp.id)
                     }
 
                     val idPart = steamApp.id

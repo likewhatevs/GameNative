@@ -219,19 +219,22 @@ private fun InstallStatusBadge(
         mutableFloatStateOf(downloadInfo?.getProgress() ?: 0f)
     }
     val isDownloading = downloadInfo != null && downloadProgress < 1f
-    var isInstalled by remember(appInfo.appId) {
+    // Resolving install state walks Room, DataStore and every install root, which is slow
+    // enough on SD-card installs to ANR the main thread — and this runs once per list card.
+    // Seed from the non-blocking cache: null means "not resolved yet".
+    var isInstalled: Boolean? by remember(appInfo.appId) {
         mutableStateOf(
             if (isSteam) {
-                SteamService.isAppInstalled(appInfo.gameId)
+                SteamService.peekAppInstalled(appInfo.gameId)
             } else {
                 true // Custom Games always installed
             },
         )
     }
 
-    LaunchedEffect(isRefreshing) {
-        if (!isRefreshing && isSteam) {
-            isInstalled = SteamService.isAppInstalled(appInfo.gameId)
+    LaunchedEffect(appInfo.appId, isRefreshing) {
+        if (isSteam && (!isRefreshing || isInstalled == null)) {
+            isInstalled = withContext(Dispatchers.IO) { SteamService.isAppInstalled(appInfo.gameId) }
         }
     }
 
@@ -241,12 +244,15 @@ private fun InstallStatusBadge(
         onDispose { downloadInfo?.removeProgressListener(onProgress) }
     }
 
+    // still resolving: stay blank instead of flashing "not installed" and then correcting
+    if (isInstalled == null && !isDownloading) return
+
     val (text, color) = when {
         !isSteam -> stringResource(R.string.library_status_ready) to MaterialTheme.colorScheme.tertiary
 
         isDownloading -> "${(downloadProgress * 100).toInt()}%" to MaterialTheme.colorScheme.primary
 
-        isInstalled -> stringResource(R.string.library_installed) to MaterialTheme.colorScheme.tertiary
+        isInstalled == true -> stringResource(R.string.library_installed) to MaterialTheme.colorScheme.tertiary
 
         else -> stringResource(R.string.library_not_installed) to MaterialTheme.colorScheme.onSurfaceVariant.copy(
             alpha = 0.6f,

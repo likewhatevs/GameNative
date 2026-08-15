@@ -19,7 +19,6 @@ import app.gamenative.utils.PlayIntegrity
 import app.gamenative.utils.downloader.ContainerFilesDownloader
 import java.io.File
 import javax.inject.Inject
-import kotlinx.coroutines.runBlocking
 import com.google.android.play.core.splitcompat.SplitCompatApplication
 import com.posthog.PersonProfiles
 
@@ -39,6 +38,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 typealias NavChangedListener = NavController.OnDestinationChangedListener
 
@@ -64,6 +64,19 @@ class PluviaApp : SplitCompatApplication() {
                     .build(),
             )
 
+            // Surfaces main-thread disk I/O — the class of bug behind the install ANRs,
+            // which is otherwise only visible on slow storage. Log only: a debug build
+            // must never die because some legacy path still reads a file on the main
+            // thread, and the startup init below deliberately still does.
+            StrictMode.setThreadPolicy(
+                StrictMode.ThreadPolicy.Builder()
+                    .detectDiskReads()
+                    .detectDiskWrites()
+                    .detectCustomSlowCalls()
+                    .penaltyLog()
+                    .build(),
+            )
+
             Timber.plant(Timber.DebugTree())
         } else {
             Timber.plant(ReleaseTree())
@@ -81,9 +94,18 @@ class PluviaApp : SplitCompatApplication() {
         // Initialize GOGConstants
         app.gamenative.service.gog.GOGConstants.init(this)
 
+        // Left on the main thread on purpose: it publishes baseDataDirPath / baseCacheDirPath /
+        // baseExternalAppDirPath, which SteamService's install and staging path getters and
+        // CustomGameScanner's roots read synchronously with no readiness check. Publishing
+        // them asynchronously would let an early reader build a path rooted at "".
         DownloadService.populateDownloadService(this)
 
-        migrateGogAmazonPaths()
+        // One-shot directory rename plus a Room rewrite. Nothing reads GOG/Amazon install
+        // paths until those libraries are opened, which needs an Activity and a login, so it
+        // does not have to hold up process start.
+        appScope.launch {
+            migrateGogAmazonPaths()
+        }
 
         appScope.launch {
             ContainerMigrator.migrateLegacyContainersIfNeeded(
@@ -135,7 +157,7 @@ class PluviaApp : SplitCompatApplication() {
      * One-time migration: moves GOG/Amazon game directories from
      * {filesDir}/ to {dataDir}/ to match Steam/Epic, and updates DB paths.
      */
-    private fun migrateGogAmazonPaths() {
+    private suspend fun migrateGogAmazonPaths() {
         if (PrefManager.gogAmazonPathMigrated) return
 
         val dataDir = dataDir.path
@@ -164,7 +186,7 @@ class PluviaApp : SplitCompatApplication() {
         val oldPrefix = "$filesDir/"
         val newPrefix = "$dataDir/"
 
-        runBlocking(Dispatchers.IO) {
+        withContext(Dispatchers.IO) {
             try {
                 val gogGames = gogGameDao.getAllAsList()
                 for (game in gogGames) {

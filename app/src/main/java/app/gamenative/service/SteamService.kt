@@ -516,21 +516,56 @@ class SteamService : Service(), IChallengeUrlChanged {
         val externalAppInstallPath: String
             get() = Paths.get(externalAppInstallRoot, "Steam", "steamapps", "common").pathString
 
+        // Every read used to re-query DataStore (a blocking read) and rebuild the list. The
+        // inputs only change when the storage prefs or the mounted volume set change, both of
+        // which call invalidateInstallPathCaches().
+        @Volatile
+        private var cachedInstallPaths: List<String>? = null
+
+        // Resolved install directory per appId. Resolving it walks Room, DataStore and the
+        // filesystem, which on SD-card installs is slow enough to ANR the caller.
+        private val appDirPathCache = ConcurrentHashMap<Int, String>()
+
+        // Last known result of isAppInstalled, so UI can seed state without blocking.
+        private val appInstalledCache = ConcurrentHashMap<Int, Boolean>()
+
         // all install paths: internal + configured external + all mounted volumes
         val allInstallPaths: List<String>
-            get() {
-                val paths = mutableListOf(internalAppInstallPath)
-                // only include configured external path if it's a real absolute path
-                if (PrefManager.externalStoragePath.isNotBlank()) {
-                    paths += externalAppInstallPath
-                }
-                for (volPath in DownloadService.externalVolumePaths) {
-                    if (volPath.isNotBlank()) {
-                        paths += Paths.get(volPath, "Steam", "steamapps", "common").pathString
-                    }
-                }
-                return paths.distinct()
+            get() = cachedInstallPaths ?: computeInstallPaths().also { cachedInstallPaths = it }
+
+        private fun computeInstallPaths(): List<String> {
+            val paths = mutableListOf(internalAppInstallPath)
+            // only include configured external path if it's a real absolute path
+            if (PrefManager.externalStoragePath.isNotBlank()) {
+                paths += externalAppInstallPath
             }
+            for (volPath in DownloadService.externalVolumePaths) {
+                if (volPath.isNotBlank()) {
+                    paths += Paths.get(volPath, "Steam", "steamapps", "common").pathString
+                }
+            }
+            return paths.distinct()
+        }
+
+        /**
+         * Drops every cached install path and every cached per-app resolution.
+         * Called whenever the set of roots to search can have changed: storage
+         * preference writes and volume (re)discovery.
+         */
+        fun invalidateInstallPathCaches() {
+            cachedInstallPaths = null
+            appDirPathCache.clear()
+            appInstalledCache.clear()
+        }
+
+        /**
+         * Drops the cached resolution for a single app. Called whenever the app's
+         * directory or its markers change: install start, install completion, deletion.
+         */
+        fun invalidateAppDirCache(appId: Int) {
+            appDirPathCache.remove(appId)
+            appInstalledCache.remove(appId)
+        }
 
         private val internalAppStagingPath: String
             get() {
@@ -776,8 +811,18 @@ class SteamService : Service(), IChallengeUrlChanged {
         }
 
         fun isAppInstalled(appId: Int): Boolean {
-            return MarkerUtils.hasMarker(getAppDirPath(appId), Marker.DOWNLOAD_COMPLETE_MARKER)
+            val installed = MarkerUtils.hasMarker(getAppDirPath(appId), Marker.DOWNLOAD_COMPLETE_MARKER)
+            appInstalledCache[appId] = installed
+            return installed
         }
+
+        /**
+         * Last value [isAppInstalled] returned for [appId], or null if it has not been
+         * resolved since the cache was last invalidated. Never touches disk, Room or
+         * DataStore, so it is safe to call during composition; callers must still run
+         * [isAppInstalled] off the main thread to get an authoritative answer.
+         */
+        fun peekAppInstalled(appId: Int): Boolean? = appInstalledCache[appId]
 
         fun getAppDlc(appId: Int): Map<Int, DepotInfo> {
             return getAppInfoOf(appId)?.let {
@@ -1134,33 +1179,61 @@ class SteamService : Service(), IChallengeUrlChanged {
         }
 
         /**
-         * Resolve best matching directory: completed install > partial > null.
-         * Extracted for testability — called by [getAppDirPath].
+         * Resolve best matching directory: completed install > resumable partial >
+         * any existing directory > null. Extracted for testability — called by [getAppDirPath].
+         *
+         * Only [Marker.DOWNLOAD_COMPLETE_MARKER] short-circuits the walk; it is the
+         * strongest signal available and nothing found later can beat it. Partial matches
+         * are remembered and only applied once every root has been probed, so a completed
+         * install at any root always wins over a partial at any other root. That matters
+         * because [allInstallPaths] probes internal storage first: an abandoned download
+         * left there — by a process kill mid-install, a restored backup, or a directory
+         * from an older version — must not shadow the real install on a card and get the
+         * game re-downloaded.
+         *
+         * A resumable partial (see [MarkerUtils.hasResumablePartialInstall]) still beats a
+         * bare leftover directory with no markers and no persisted progress.
          */
         fun resolveExistingAppDir(installPaths: List<String>, names: List<String>): String? {
+            var firstResumable: String? = null
             var firstExisting: String? = null
             for (basePath in installPaths) {
                 for (name in names) {
                     if (name.isEmpty()) continue
                     val path = Paths.get(basePath, name)
-                    if (Files.isDirectory(path)) {
-                        if (MarkerUtils.hasMarker(path.pathString, Marker.DOWNLOAD_COMPLETE_MARKER)) {
-                            return path.pathString
-                        }
-                        if (firstExisting == null) firstExisting = path.pathString
+                    if (!Files.isDirectory(path)) continue
+                    val dir = path.pathString
+                    if (MarkerUtils.hasMarker(dir, Marker.DOWNLOAD_COMPLETE_MARKER)) {
+                        return dir
                     }
+                    if (firstResumable == null && MarkerUtils.hasResumablePartialInstall(dir)) {
+                        firstResumable = dir
+                    }
+                    if (firstExisting == null) firstExisting = dir
                 }
             }
-            return firstExisting
+            return firstResumable ?: firstExisting
         }
 
         fun getAppDirPath(gameId: Int): String {
+            appDirPathCache[gameId]?.let { return it }
+            val resolved = resolveAppDirPath(gameId)
+            // Only memoise answers derived from a real app record. Before the Steam app
+            // info is in Room, or for an imported app with a blank path, resolution
+            // degrades to the bare install root — caching that would pin it permanently.
+            if (resolved.cacheable) appDirPathCache[gameId] = resolved.path
+            return resolved.path
+        }
+
+        private class ResolvedAppDir(val path: String, val cacheable: Boolean)
+
+        private fun resolveAppDirPath(gameId: Int): ResolvedAppDir {
             val info = getAppInfoOf(gameId)
 
             // For installed game, check whether it has customInstallPath and return it
             val appInfo = getInstalledApp(gameId)
             if (appInfo != null && appInfo.isImported) {
-                return appInfo.customInstallPath
+                return ResolvedAppDir(appInfo.customInstallPath, appInfo.customInstallPath.isNotEmpty())
             }
 
             val appName = getAppDirName(info)
@@ -1169,13 +1242,41 @@ class SteamService : Service(), IChallengeUrlChanged {
 
             // prefer completed installs over partial/stale directories
             val resolved = resolveExistingAppDir(allInstallPaths, names)
-            if (resolved != null) return resolved
+            if (resolved != null) return ResolvedAppDir(resolved, true)
 
             // nothing on disk yet — default to preferred install location
-            if (PrefManager.useExternalStorage) {
-                return Paths.get(externalAppInstallPath, appName).pathString
-            }
-            return Paths.get(internalAppInstallPath, appName).pathString
+            val root = if (PrefManager.useExternalStorage) externalAppInstallPath else internalAppInstallPath
+            return ResolvedAppDir(Paths.get(root, appName).pathString, appName.isNotEmpty())
+        }
+
+        /**
+         * Stamps the target directory as an active install, the same way
+         * EpicDownloadManager, GOGDownloadManager and AmazonDownloadManager already do for
+         * their sources. The Steam path was the only one not following the convention, so
+         * [MarkerUtils.hasResumablePartialInstall] had no way to tell an interrupted Steam
+         * download apart from an unrelated leftover directory.
+         *
+         * The directory has to exist for [MarkerUtils.addMarker] to write into it; the
+         * downloader would create it moments later anyway.
+         */
+        private fun markInstallStarted(appId: Int, appDirPath: String) {
+            runCatching { File(appDirPath).mkdirs() }
+                .onFailure { Timber.w(it, "Could not create install dir $appDirPath for app $appId") }
+            MarkerUtils.addMarker(appDirPath, Marker.DOWNLOAD_IN_PROGRESS_MARKER)
+            invalidateAppDirCache(appId)
+        }
+
+        /**
+         * Clears the active-install stamp. Hung off the download job's completion handler
+         * rather than the individual exit points, so it covers every terminal path the job
+         * has — normal completion, the caught failure, and cancellation — without relying
+         * on an enumeration staying exhaustive. A process kill leaves the marker behind,
+         * which is the same state the other three download managers leave and is what makes
+         * the install read as resumable afterwards.
+         */
+        private fun markInstallFinished(appId: Int, appDirPath: String) {
+            MarkerUtils.removeMarker(appDirPath, Marker.DOWNLOAD_IN_PROGRESS_MARKER)
+            invalidateAppDirCache(appId)
         }
 
         private fun isExecutable(flags: Any): Boolean = when (flags) {
@@ -1416,10 +1517,15 @@ class SteamService : Service(), IChallengeUrlChanged {
 
                 if (appDir.exists()) {
                     MarkerUtils.removeMarker(appDirPath, Marker.DOWNLOAD_COMPLETE_MARKER)
+                    MarkerUtils.removeMarker(appDirPath, Marker.DOWNLOAD_IN_PROGRESS_MARKER)
                 }
 
                 File(appDirPath).deleteRecursively()
             }
+
+            // the directory this app resolved to is gone, and so are its DLC rows
+            invalidateAppDirCache(appId)
+            getDownloadableDlcAppsOf(appId).orEmpty().forEach { invalidateAppDirCache(it.id) }
 
             // Remove from DB
             workshopPausedApps.remove(appId)
@@ -1930,6 +2036,10 @@ class SteamService : Service(), IChallengeUrlChanged {
                             return@launch
                         }
 
+                        // only stamp once we know the download will actually run, so an
+                        // aborted job never leaves an empty directory looking partial
+                        markInstallStarted(appId, appDirPath)
+
                         // Moved to DownloadSpeedConfig
                         val speedConfig = DownloadSpeedConfig()
                         val cpuCores = speedConfig.cpuCores
@@ -2201,6 +2311,7 @@ class SteamService : Service(), IChallengeUrlChanged {
                     // handlers, and cancellations thrown out of suspension points.
                     // second call is a no-op if the inline path already removed the entry.
                     removeDownloadJob(appId)
+                    markInstallFinished(appId, appDirPath)
                     chunkStagingRedirectDir?.deleteRecursively()
                     if (throwable is kotlinx.coroutines.CancellationException) {
                         Timber.d(throwable, "Download canceled for app $appId")
@@ -2253,6 +2364,9 @@ class SteamService : Service(), IChallengeUrlChanged {
                 )
             }
 
+            // the AppInfo row this app resolves through just changed
+            invalidateAppDirCache(downloadingAppId)
+
             // Remove completed appId from downloadInfo.dlcAppIds
             downloadInfo.downloadingAppIds.removeIf { it == downloadingAppId }
 
@@ -2261,9 +2375,15 @@ class SteamService : Service(), IChallengeUrlChanged {
                 // Handle completion: add markers
                 withContext(Dispatchers.IO) {
                     MarkerUtils.addMarker(appDirPath, Marker.DOWNLOAD_COMPLETE_MARKER)
+                    MarkerUtils.removeMarker(appDirPath, Marker.DOWNLOAD_IN_PROGRESS_MARKER)
                     MarkerUtils.removeMarker(appDirPath, Marker.STEAM_DLL_REPLACED)
                     MarkerUtils.removeMarker(appDirPath, Marker.STEAM_COLDCLIENT_USED)
                 }
+
+                // markers just changed which directory wins, and whether the app reads as
+                // installed — drop the cached resolution for everything this job wrote
+                invalidateAppDirCache(downloadingAppId)
+                invalidateAppDirCache(downloadInfo.gameId)
 
                 // clean up DB record BEFORE notifying UI to avoid stale "Resume" button
                 instance?.downloadingAppInfoDao?.deleteApp(downloadInfo.gameId)
