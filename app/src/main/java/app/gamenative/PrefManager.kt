@@ -45,6 +45,9 @@ import timber.log.Timber
  */
 object PrefManager {
 
+    /** How long [setLongBlocking] waits for its write to reach disk before giving up. */
+    private const val BLOCKING_WRITE_TIMEOUT_MS = 5_000L
+
     /**
      * Threads for everything that touches DataStore, including DataStore's own
      * internals.
@@ -186,10 +189,18 @@ object PrefManager {
     fun getLong(key: String, defaultValue: Long): Long =
         getPref(longPreferencesKey(key), defaultValue)
 
-    /** Unlike [setFloat] this returns only once the value is stored, for callers that must not lose it to a crash. */
+    /**
+     * Unlike [setFloat] this returns only once the value is stored, for callers that must not
+     * lose it to a crash.
+     *
+     * It still goes through [setPref] rather than writing to the store directly: reads are
+     * served from the in-memory snapshot, so a direct write would persist a value that every
+     * subsequent read would fail to see.
+     */
     fun setLongBlocking(key: String, value: Long) {
-        runBlocking {
-            dataStore.edit { pref -> pref[longPreferencesKey(key)] = value }
+        setPref(longPreferencesKey(key), value)
+        if (!awaitPendingWrites(BLOCKING_WRITE_TIMEOUT_MS)) {
+            Timber.w("Timed out persisting $key; it may not survive a crash")
         }
     }
 
