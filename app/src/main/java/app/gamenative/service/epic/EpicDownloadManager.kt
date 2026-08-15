@@ -1179,15 +1179,11 @@ class EpicDownloadManager @Inject constructor(
                     return@withContext Result.failure(Exception("Download cancelled"))
                 }
 
-                // Calculate storage usage stats (only scan cache dir, not entire install dir)
-                val chunkCacheSize = calculateDirectorySize(chunkCacheDir)
-
+                // No cache size in this line: measuring it stats every cached chunk on the
+                // install volume, once per pass, competing with the download it reports on.
                 Timber.tag("EPIC").d(
-                    """Waiting for $currentPendingChunks pending chunks
-                    |  Cache: ${chunkCacheSize / 1_000_000}MB
-                    |  Game files: ${totalExpectedSize / 1_000_000}MB
-                    |  Total disk: ${(chunkCacheSize + totalExpectedSize) / 1_000_000}MB
-                    """.trimMargin()
+                    "Waiting for $currentPendingChunks pending chunks, " +
+                        "game files: ${totalExpectedSize / 1_000_000}MB"
                 )
 
                 if (currentPendingChunks == lastPendingChunks) {
