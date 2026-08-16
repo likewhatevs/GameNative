@@ -25,6 +25,7 @@ import app.gamenative.utils.SteamSaveSweep
 import app.gamenative.utils.SteamUtils
 import `in`.dragonbra.javasteam.enums.EOSType
 import `in`.dragonbra.javasteam.enums.EResult
+import `in`.dragonbra.javasteam.protobufs.steamclient.Enums.ECloudStoragePersistState
 import `in`.dragonbra.javasteam.steam.handlers.steamcloud.AppFileChangeList
 import `in`.dragonbra.javasteam.steam.handlers.steamcloud.AppFileInfo
 import `in`.dragonbra.javasteam.steam.handlers.steamcloud.SteamCloud
@@ -1081,8 +1082,38 @@ object SteamAutoCloud {
 
                     val uploadResult: UserFilesUploadResult
 
+                    // Steam de-lists a cloud file by marking it Forgotten or Deleted rather than
+                    // dropping it from the list. FileForget is Valve's sanctioned way to free
+                    // quota without touching the user's local copy, so that local file is still
+                    // on disk and still looks like something to upload. Sending it again would
+                    // undo the de-listing on the very next sync - the loop the cloud cleanup
+                    // exists to break.
+                    val tombstoned = appFileListChange.files
+                        .filter {
+                            it.persistState == ECloudStoragePersistState.k_ECloudStoragePersistStateForgotten ||
+                                it.persistState == ECloudStoragePersistState.k_ECloudStoragePersistStateDeleted
+                        }
+                        .map { getFilePrefixPath(it, appFileListChange) }
+                        .toSet()
+
+                    val uploadableChanges = if (tombstoned.isEmpty()) {
+                        fileChanges
+                    } else {
+                        val skipped = (fileChanges.filesCreated + fileChanges.filesModified)
+                            .count { it.prefixPath in tombstoned }
+
+                        if (skipped > 0) {
+                            Timber.i("Skipping $skipped file(s) of ${appInfo.id} de-listed in the cloud")
+                        }
+
+                        fileChanges.copy(
+                            filesCreated = fileChanges.filesCreated.filterNot { it.prefixPath in tombstoned },
+                            filesModified = fileChanges.filesModified.filterNot { it.prefixPath in tombstoned },
+                        )
+                    }
+
                     microsecUploadFiles = measureTime {
-                        uploadResult = uploadFiles(fileChanges, parentScope).await()
+                        uploadResult = uploadFiles(uploadableChanges, parentScope).await()
                         filesUploaded = uploadResult.filesUploaded
                         bytesUploaded = uploadResult.bytesUploaded
                     }.inWholeMicroseconds
