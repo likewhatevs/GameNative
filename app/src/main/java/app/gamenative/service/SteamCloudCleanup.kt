@@ -6,6 +6,7 @@ import app.gamenative.data.UFS
 import app.gamenative.enums.PathType
 import app.gamenative.utils.SteamSaveSweep
 import app.gamenative.utils.SteamUtils
+import `in`.dragonbra.javasteam.enums.EOSType
 import `in`.dragonbra.javasteam.enums.EResult
 import `in`.dragonbra.javasteam.steam.handlers.steamcloud.AppFileChangeList
 import `in`.dragonbra.javasteam.steam.handlers.steamcloud.SteamCloud
@@ -154,6 +155,12 @@ object SteamCloudCleanup {
 
         SteamAutoCloud.closeAbandonedUploadBatch(steamCloud, appInfo.id)
 
+        // Batches only take effect inside an app sync session, and Steam will not hand one out
+        // while another client holds an upload pending for the app. Both halves matter: without
+        // the session the deletes are accepted and quietly dropped, and without adopting the
+        // stale flag there is no session to be had. Opened here, closed after the deletes.
+        beginSyncSession(appInfo, clientId, steamInstance, steamCloud)
+
         val batchKey = SteamAutoCloud.openUploadBatchKey(appInfo.id)
         val appBuildId = appInfo.branches[SteamService.getInstalledApp(appInfo.id)?.branch ?: "public"]?.buildId ?: 0
         val failedPaths = mutableListOf<String>()
@@ -181,11 +188,27 @@ object SteamCloudCleanup {
                 PrefManager.setLongBlocking(batchKey, batch.batchID)
 
                 var batchSuccess = true
+                var deletedInChunk = 0
 
                 try {
-                    // Reported from inside the batch on purpose: anything that throws here, a
-                    // cancelled caller included, has to leave through the close below.
-                    onProgress?.invoke(deleted + chunk.size, paths.size)
+                    // Naming the files when the batch opens only declares the intent; each one
+                    // still has to be deleted individually inside the batch or Steam keeps them
+                    // and the batch completes clean anyway. This call also returns a per-file
+                    // result, which the batch never does, so failures stop being invisible.
+                    chunk.forEach { path ->
+                        val ok = steamCloud.deleteFile(appInfo.id, path, batch.batchID).await()
+
+                        if (ok) {
+                            deletedInChunk++
+                        } else {
+                            Timber.w("Steam refused to delete $path of ${appInfo.id}")
+                            failedPaths += path
+                        }
+
+                        // Reported from inside the batch on purpose: anything that throws here, a
+                        // cancelled caller included, has to leave through the close below.
+                        onProgress?.invoke(deleted + deletedInChunk, paths.size)
+                    }
                 } catch (e: Exception) {
                     batchSuccess = false
                     throw e
@@ -205,7 +228,7 @@ object SteamCloudCleanup {
                     }
                 }
 
-                deleted += chunk.size
+                deleted += deletedInChunk
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
@@ -216,7 +239,82 @@ object SteamCloudCleanup {
 
         Timber.i("Cloud cleanup of ${appInfo.id}: deleted $deleted of ${paths.size} file(s)")
 
+        // Closing the session is what commits the batches above; leaving it open would also leave
+        // the app holding the very pending-upload flag this exists to clear.
+        endSyncSession(appInfo, clientId, steamCloud)
+
         return CleanupResult(requested = paths.size, deleted = deleted, failedPaths = failedPaths)
+    }
+
+    /**
+     * Opens the app sync session the delete batches are committed inside, adopting a stale one.
+     *
+     * A batch is only applied as part of a sync session; sending one outside a session is accepted
+     * and silently dropped, which reads as a successful cleanup that changed nothing. Steam will
+     * not open a session while another client holds an upload pending for the app, and a run that
+     * died mid-upload leaves exactly that behind - so the flag has to be taken over rather than
+     * waited out.
+     *
+     * [SteamAutoCloud.closeAbandonedUploadBatch] already covers a batch this install still
+     * remembers, but it reads the locally persisted batch id, which is gone once app data is
+     * cleared or the game is reinstalled. The flag on Steam's side outlives that record, so
+     * reconcile the way the file scan does - against what the cloud actually reports.
+     *
+     * Best effort: a failure here is logged, and the deletes are still attempted.
+     */
+    private suspend fun beginSyncSession(
+        appInfo: SteamApp,
+        clientId: Long,
+        steamInstance: SteamService,
+        steamCloud: SteamCloud,
+    ) {
+        try {
+            val pending = steamCloud.signalAppLaunchIntent(
+                appId = appInfo.id,
+                clientId = clientId,
+                machineName = SteamUtils.getMachineName(steamInstance),
+                // The point of this call: adopt a stale session rather than refuse to act on it.
+                ignorePendingOperations = true,
+                osType = EOSType.WinUnknown,
+            ).await()
+
+            if (pending.isEmpty()) {
+                Timber.i("Opened cleanup sync session for ${appInfo.id}, no pending operations")
+            } else {
+                Timber.i(
+                    "Opened cleanup sync session for %d, taking over: %s",
+                    appInfo.id,
+                    pending.joinToString { "${it.operation} on ${it.machineName} (client ${it.clientId})" },
+                )
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Timber.e(e, "Failed to open cleanup sync session for ${appInfo.id}")
+        }
+    }
+
+    /**
+     * Ends the sync session, which is what commits the batches sent inside it.
+     *
+     * Reported as nothing outstanding: the deletes were declared when their batches were opened,
+     * so there is no upload left to finish, and saying otherwise would leave the app holding the
+     * pending-upload flag this whole path exists to clear.
+     */
+    private suspend fun endSyncSession(appInfo: SteamApp, clientId: Long, steamCloud: SteamCloud) {
+        try {
+            steamCloud.signalAppExitSyncDone(
+                appId = appInfo.id,
+                clientId = clientId,
+                uploadsCompleted = true,
+                uploadsRequired = false,
+            )
+            Timber.i("Closed cleanup sync session for ${appInfo.id}")
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Timber.e(e, "Failed to close cleanup sync session for ${appInfo.id}")
+        }
     }
 
     internal fun toRemoteFiles(fileList: AppFileChangeList): List<RemoteFile> = fileList.files.map { file ->
