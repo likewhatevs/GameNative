@@ -8,12 +8,16 @@ import app.gamenative.utils.SteamSaveSweep
 import app.gamenative.utils.SteamUtils
 import `in`.dragonbra.javasteam.enums.EOSType
 import `in`.dragonbra.javasteam.enums.EResult
+import `in`.dragonbra.javasteam.protobufs.steamclient.Enums.ECloudStoragePersistState
 import `in`.dragonbra.javasteam.steam.handlers.steamcloud.AppFileChangeList
+import `in`.dragonbra.javasteam.steam.handlers.steamcloud.AppFileInfo
 import `in`.dragonbra.javasteam.steam.handlers.steamcloud.SteamCloud
 import java.nio.file.Paths
 import kotlin.io.path.pathString
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.future.await
 import kotlinx.coroutines.withContext
 import timber.log.Timber
@@ -134,12 +138,12 @@ object SteamCloudCleanup {
     /**
      * Deletes [paths] from the app's cloud storage in batches.
      *
-     * A batch declares its deletions in the request that opens it, the same way the sync path
-     * removes files, so no per-file transfer follows. Every batch is completed on the way out with
-     * the result it actually had, since one left open blocks the app's next sync.
+     * A batch declares its deletions in the request that opens it, then every path is explicitly
+     * deleted inside that batch. Every batch is completed on the way out with the result it
+     * actually had, since one left open blocks the app's next sync.
      *
-     * A batch that fails costs only its own chunk: the loop carries on and the paths it held are
-     * reported back so the caller can say what survived.
+     * A transfer failure costs only its own chunk. A close failure stops the loop so the persisted
+     * batch ID remains the recovery handle instead of being overwritten by a later batch.
      */
     suspend fun deleteFiles(
         appInfo: SteamApp,
@@ -155,95 +159,222 @@ object SteamCloudCleanup {
 
         SteamAutoCloud.closeAbandonedUploadBatch(steamCloud, appInfo.id)
 
-        // Batches only take effect inside an app sync session, and Steam will not hand one out
-        // while another client holds an upload pending for the app. Both halves matter: without
-        // the session the deletes are accepted and quietly dropped, and without adopting the
-        // stale flag there is no session to be had. Opened here, closed after the deletes.
-        beginSyncSession(appInfo, clientId, steamInstance, steamCloud)
-
         val batchKey = SteamAutoCloud.openUploadBatchKey(appInfo.id)
         val appBuildId = appInfo.branches[SteamService.getInstalledApp(appInfo.id)?.branch ?: "public"]?.buildId ?: 0
         val failedPaths = mutableListOf<String>()
         var deleted = 0
+        var result = CleanupResult(requested = paths.size, deleted = 0, failedPaths = paths)
+        var sessionOpened = false
+        var recoveryBatchOpen = false
+        var allDeletesSucceeded = false
+        var primaryCancellation: CancellationException? = null
+        val callerContext = currentCoroutineContext()
 
-        for (chunk in paths.chunked(MAX_DELETES_PER_BATCH)) {
-            try {
-                val batch = steamCloud.beginAppUploadBatch(
-                    appId = appInfo.id,
-                    machineName = SteamUtils.getMachineName(steamInstance),
-                    clientId = clientId,
-                    filesToDelete = chunk,
-                    filesToUpload = emptyList(),
-                    appBuildId = appBuildId,
-                ).await()
+        fun pendingCallerCancellation(): CancellationException? = try {
+            callerContext.ensureActive()
+            null
+        } catch (e: CancellationException) {
+            e
+        }
 
-                // As in the upload path, an unset batch id is the only sign Steam refused the
-                // batch, and there is then nothing to complete.
-                if (batch.batchID == 0L) {
-                    Timber.e("Steam did not open a delete batch for ${appInfo.id}, skipping ${chunk.size} file(s)")
-                    failedPaths += chunk
-                    continue
-                }
-
-                PrefManager.setLongBlocking(batchKey, batch.batchID)
-
-                var batchSuccess = true
-                var deletedInChunk = 0
-
-                try {
-                    // Naming the files when the batch opens only declares the intent; each one
-                    // still has to be deleted individually inside the batch or Steam keeps them
-                    // and the batch completes clean anyway. This call also returns a per-file
-                    // result, which the batch never does, so failures stop being invisible.
-                    chunk.forEach { path ->
-                        val ok = steamCloud.deleteFile(appInfo.id, path, batch.batchID).await()
-
-                        if (ok) {
-                            deletedInChunk++
-                        } else {
-                            Timber.w("Steam refused to delete $path of ${appInfo.id}")
-                            failedPaths += path
+        try {
+            // Batches only take effect inside an app sync session. Refuse to report or attempt any
+            // deletion when Steam did not confirm that the session opened.
+            // Record the confirmed open before cancellation can resume at the caller. Otherwise a
+            // cancellation while launch-intent is in flight can open a server session and skip the
+            // outer finally's matching close.
+            withContext(NonCancellable) {
+                sessionOpened = beginSyncSession(appInfo, clientId, steamInstance, steamCloud)
+            }
+            currentCoroutineContext().ensureActive()
+            if (sessionOpened) {
+                val chunks = paths.chunked(MAX_DELETES_PER_BATCH)
+                for ((chunkIndex, chunk) in chunks.withIndex()) {
+                    var batchCloseFailed = false
+                    try {
+                        currentCoroutineContext().ensureActive()
+                        val batch = withContext(NonCancellable) {
+                            steamCloud.beginAppUploadBatch(
+                                appId = appInfo.id,
+                                machineName = SteamUtils.getMachineName(steamInstance),
+                                clientId = clientId,
+                                filesToDelete = chunk,
+                                filesToUpload = emptyList(),
+                                appBuildId = appBuildId,
+                            ).await().also { openedBatch ->
+                                if (openedBatch.batchID != 0L) {
+                                    recoveryBatchOpen = true
+                                    try {
+                                        PrefManager.setLongBlocking(batchKey, openedBatch.batchID)
+                                    } catch (e: Exception) {
+                                        try {
+                                            steamCloud.completeAppUploadBatch(
+                                                appId = appInfo.id,
+                                                batchId = openedBatch.batchID,
+                                                batchEResult = EResult.Fail,
+                                            ).await()
+                                            recoveryBatchOpen = false
+                                        } catch (closeFailure: Exception) {
+                                            batchCloseFailed = true
+                                            if (e is CancellationException) {
+                                                if (closeFailure !== e) e.addSuppressed(closeFailure)
+                                            } else if (closeFailure is CancellationException) {
+                                                closeFailure.addSuppressed(e)
+                                                throw closeFailure
+                                            } else if (closeFailure !== e) {
+                                                e.addSuppressed(closeFailure)
+                                            }
+                                        }
+                                        throw e
+                                    }
+                                }
+                            }
                         }
 
-                        // Reported from inside the batch on purpose: anything that throws here, a
-                        // cancelled caller included, has to leave through the close below.
-                        onProgress?.invoke(deleted + deletedInChunk, paths.size)
-                    }
-                } catch (e: Exception) {
-                    batchSuccess = false
-                    throw e
-                } finally {
-                    withContext(NonCancellable) {
-                        val batchEResult = if (batchSuccess) EResult.OK else EResult.Fail
+                        // As in the upload path, an unset batch id is the only sign Steam refused
+                        // the batch, and there is then nothing to complete.
+                        if (batch.batchID == 0L) {
+                            currentCoroutineContext().ensureActive()
+                            Timber.e("Steam did not open a delete batch for ${appInfo.id}, skipping ${chunk.size} file(s)")
+                            failedPaths += chunk
+                            continue
+                        }
 
-                        Timber.i("Completing delete batch ${batch.batchID} of ${appInfo.id} with $batchEResult")
+                        var batchSuccess = true
+                        var deletedInChunk = 0
+                        var operationCancellation: CancellationException? = null
 
-                        steamCloud.completeAppUploadBatch(
-                            appId = appInfo.id,
-                            batchId = batch.batchID,
-                            batchEResult = batchEResult,
-                        ).await()
+                        try {
+                            currentCoroutineContext().ensureActive()
+                            chunk.forEach { path ->
+                                val ok = steamCloud.deleteFile(appInfo.id, path, batch.batchID).await()
 
-                        PrefManager.setLongBlocking(batchKey, 0L)
+                                if (ok) {
+                                    deletedInChunk++
+                                } else {
+                                    Timber.w("Steam refused to delete $path of ${appInfo.id}")
+                                    batchSuccess = false
+                                    failedPaths += path
+                                }
+                                onProgress?.invoke(deleted + deletedInChunk, paths.size)
+                            }
+                        } catch (e: CancellationException) {
+                            batchSuccess = false
+                            operationCancellation = e
+                            throw e
+                        } catch (e: Exception) {
+                            batchSuccess = false
+                            throw e
+                        } finally {
+                            withContext(NonCancellable) {
+                                val batchEResult = if (batchSuccess) EResult.OK else EResult.Fail
+
+                                Timber.i("Completing delete batch ${batch.batchID} of ${appInfo.id} with $batchEResult")
+                                try {
+                                    steamCloud.completeAppUploadBatch(
+                                        appId = appInfo.id,
+                                        batchId = batch.batchID,
+                                        batchEResult = batchEResult,
+                                    ).await()
+                                } catch (e: Exception) {
+                                    // Do not open another batch after this. Its persisted ID is the
+                                    // only recovery handle we have, and a later batch would overwrite it.
+                                    batchCloseFailed = true
+                                    operationCancellation?.let { cancellation ->
+                                        if (e !== cancellation) cancellation.addSuppressed(e)
+                                        throw cancellation
+                                    }
+                                    throw e
+                                }
+                                recoveryBatchOpen = false
+                                PrefManager.setLongBlocking(batchKey, 0L)
+                            }
+                        }
+
+                        // NonCancellable protects the durable close, but must not consume a
+                        // cancellation that arrived while that close was in flight.
+                        currentCoroutineContext().ensureActive()
+                        if (batchSuccess) {
+                            deleted += deletedInChunk
+                        } else {
+                            // A failed batch does not commit any of its individual operations.
+                            failedPaths += chunk
+                        }
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (e: Exception) {
+                        // If cancellation raced the non-cancellable close and the close itself
+                        // failed, preserve cancellation as the primary outcome while retaining the
+                        // close failure as diagnostic context.
+                        try {
+                            currentCoroutineContext().ensureActive()
+                        } catch (cancellation: CancellationException) {
+                            cancellation.addSuppressed(e)
+                            throw cancellation
+                        }
+                        Timber.e(e, "Delete batch of ${chunk.size} file(s) failed for ${appInfo.id}")
+                        failedPaths += chunk
+                        if (batchCloseFailed) {
+                            chunks.drop(chunkIndex + 1).forEach { remaining -> failedPaths += remaining }
+                            break
+                        }
                     }
                 }
 
-                deleted += deletedInChunk
-            } catch (e: CancellationException) {
-                throw e
-            } catch (e: Exception) {
-                Timber.e(e, "Delete batch of ${chunk.size} file(s) failed for ${appInfo.id}")
-                failedPaths += chunk
+                Timber.i("Cloud cleanup of ${appInfo.id}: deleted $deleted of ${paths.size} file(s)")
+                result = CleanupResult(
+                    requested = paths.size,
+                    deleted = deleted,
+                    failedPaths = failedPaths.distinct(),
+                )
+                allDeletesSucceeded = deleted == paths.size && failedPaths.isEmpty()
+            }
+        } catch (e: CancellationException) {
+            primaryCancellation = e
+            throw e
+        } finally {
+            // A cancelled caller or failed batch must not strand the sync session. If Steam does
+            // not confirm the close, conservatively report every requested path as unresolved.
+            if (sessionOpened) {
+                val cancellationBeforeClose = pendingCallerCancellation()
+                val unresolved = !allDeletesSucceeded || recoveryBatchOpen ||
+                    primaryCancellation != null || cancellationBeforeClose != null
+                val sessionCloseFailure = try {
+                    withContext(NonCancellable) {
+                        endSyncSession(
+                            appInfo = appInfo,
+                            clientId = clientId,
+                            steamCloud = steamCloud,
+                            uploadsCompleted = !unresolved,
+                            uploadsRequired = unresolved,
+                        )
+                    }
+                    null
+                } catch (e: Exception) {
+                    Timber.e(e, "Failed to close cleanup sync session for ${appInfo.id}")
+                    e
+                }
+                if (sessionCloseFailure != null) {
+                    result = CleanupResult(requested = paths.size, deleted = 0, failedPaths = paths)
+                }
+
+                val cancellation = primaryCancellation
+                    ?: cancellationBeforeClose
+                    ?: pendingCallerCancellation()
+                    ?: (sessionCloseFailure as? CancellationException)
+                if (cancellation != null) {
+                    if (sessionCloseFailure != null && sessionCloseFailure !== cancellation) {
+                        cancellation.addSuppressed(sessionCloseFailure)
+                    }
+                    throw cancellation
+                }
             }
         }
 
-        Timber.i("Cloud cleanup of ${appInfo.id}: deleted $deleted of ${paths.size} file(s)")
-
-        // Closing the session is what commits the batches above; leaving it open would also leave
-        // the app holding the very pending-upload flag this exists to clear.
-        endSyncSession(appInfo, clientId, steamCloud)
-
-        return CleanupResult(requested = paths.size, deleted = deleted, failedPaths = failedPaths)
+        // As with the batch close, ending the session is deliberately non-cancellable; restore
+        // structured cancellation once the server-side cleanup attempt has finished.
+        currentCoroutineContext().ensureActive()
+        return result
     }
 
     /**
@@ -260,14 +391,14 @@ object SteamCloudCleanup {
      * cleared or the game is reinstalled. The flag on Steam's side outlives that record, so
      * reconcile the way the file scan does - against what the cloud actually reports.
      *
-     * Best effort: a failure here is logged, and the deletes are still attempted.
+     * A failure here is fail-closed: no delete batch is opened without a confirmed session.
      */
     private suspend fun beginSyncSession(
         appInfo: SteamApp,
         clientId: Long,
         steamInstance: SteamService,
         steamCloud: SteamCloud,
-    ) {
+    ): Boolean {
         try {
             val pending = steamCloud.signalAppLaunchIntent(
                 appId = appInfo.id,
@@ -287,48 +418,55 @@ object SteamCloudCleanup {
                     pending.joinToString { "${it.operation} on ${it.machineName} (client ${it.clientId})" },
                 )
             }
+            return true
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
             Timber.e(e, "Failed to open cleanup sync session for ${appInfo.id}")
+            return false
         }
     }
 
     /**
      * Ends the sync session, which is what commits the batches sent inside it.
      *
-     * Reported as nothing outstanding: the deletes were declared when their batches were opened,
-     * so there is no upload left to finish, and saying otherwise would leave the app holding the
-     * pending-upload flag this whole path exists to clear.
+     * Successful cleanup reports nothing outstanding. Partial, cancelled, or recoverable cleanup
+     * reports outstanding work so Steam does not treat uncommitted deletions as complete.
      */
-    private suspend fun endSyncSession(appInfo: SteamApp, clientId: Long, steamCloud: SteamCloud) {
-        try {
-            steamCloud.signalAppExitSyncDone(
-                appId = appInfo.id,
-                clientId = clientId,
-                uploadsCompleted = true,
-                uploadsRequired = false,
-            )
-            Timber.i("Closed cleanup sync session for ${appInfo.id}")
-        } catch (e: CancellationException) {
-            throw e
-        } catch (e: Exception) {
-            Timber.e(e, "Failed to close cleanup sync session for ${appInfo.id}")
-        }
+    private suspend fun endSyncSession(
+        appInfo: SteamApp,
+        clientId: Long,
+        steamCloud: SteamCloud,
+        uploadsCompleted: Boolean,
+        uploadsRequired: Boolean,
+    ) {
+        steamCloud.signalAppExitSyncDone(
+            appId = appInfo.id,
+            clientId = clientId,
+            uploadsCompleted = uploadsCompleted,
+            uploadsRequired = uploadsRequired,
+        )
+        Timber.i("Closed cleanup sync session for ${appInfo.id}")
     }
 
-    internal fun toRemoteFiles(fileList: AppFileChangeList): List<RemoteFile> = fileList.files.map { file ->
-        RemoteFile(
-            // Mirrors the prefix the download path builds, so the two name the same file.
-            prefix = if (file.hasPathPrefixIndex && file.pathPrefixIndex < fileList.pathPrefixes.size) {
-                Paths.get(fileList.pathPrefixes[file.pathPrefixIndex]).pathString
-            } else {
-                ""
-            },
-            filename = file.filename,
-            sizeBytes = file.rawFileSize.toLong(),
-        )
-    }
+    private fun AppFileInfo.isTombstoned(): Boolean =
+        persistState == ECloudStoragePersistState.k_ECloudStoragePersistStateForgotten ||
+            persistState == ECloudStoragePersistState.k_ECloudStoragePersistStateDeleted
+
+    internal fun toRemoteFiles(fileList: AppFileChangeList): List<RemoteFile> = fileList.files
+        .filterNot { it.isTombstoned() }
+        .map { file ->
+            RemoteFile(
+                // Mirrors the prefix the download path builds, so the two name the same file.
+                prefix = if (file.hasPathPrefixIndex && file.pathPrefixIndex < fileList.pathPrefixes.size) {
+                    Paths.get(fileList.pathPrefixes[file.pathPrefixIndex]).pathString
+                } else {
+                    ""
+                },
+                filename = file.filename,
+                sizeBytes = file.rawFileSize.toLong(),
+            )
+        }
 
     /**
      * The cloud path prefixes this device's save rules cover.

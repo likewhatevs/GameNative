@@ -36,10 +36,13 @@ import java.io.InputStream
 import java.io.RandomAccessFile
 import java.security.MessageDigest
 import java.nio.file.Files
+import java.nio.file.AtomicMoveNotSupportedException
 import java.nio.file.FileSystemException
 import java.nio.file.Path
 import java.nio.file.Paths
+import java.nio.file.StandardCopyOption
 import java.util.Date
+import java.util.Locale
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.zip.ZipInputStream
 import kotlin.io.path.name
@@ -51,6 +54,8 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.future.await
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
@@ -91,6 +96,33 @@ object SteamAutoCloud {
      * wrap for a file above 2 GiB.
      */
     internal const val MAX_CLOUD_FILE_SIZE_BYTES: Long = 100L * 1024 * 1024
+
+    /**
+     * Normalizes the different spellings Steam and local scans use for the same cloud key.
+     * In particular, placeholders may be followed by no slash, separators may be Windows-style,
+     * and Steam Cloud paths are case-insensitive.
+     */
+    internal fun canonicalCloudKey(path: String): String {
+        val normalized = path.trim().replace('\\', '/').replace(Regex("/+"), "/")
+        val placeholder = Regex("^%[^%]+%").find(normalized)?.value
+
+        return if (placeholder != null) {
+            val suffix = normalized.removePrefix(placeholder).trim('/')
+            buildString {
+                append(placeholder.lowercase(Locale.ROOT))
+                if (suffix.isNotEmpty()) {
+                    append('/')
+                    append(suffix.lowercase(Locale.ROOT))
+                }
+            }
+        } else {
+            normalized.trim('/').lowercase(Locale.ROOT)
+        }
+    }
+
+    private fun AppFileInfo.isTombstoned(): Boolean =
+        persistState == ECloudStoragePersistState.k_ECloudStoragePersistStateForgotten ||
+            persistState == ECloudStoragePersistState.k_ECloudStoragePersistStateDeleted
 
     /**
      * Checks a would-be cloud file set against the per-app quota the app declares in its ufs
@@ -420,26 +452,6 @@ object SteamAutoCloud {
             changesExist to FileChanges(deletedFiles, modifiedFiles, newFiles)
         }
 
-        val hasHashConflicts: (Map<String, List<UserFileInfo>>, AppFileChangeList) -> Boolean =
-            { localUserFiles, fileList ->
-                fileList.files.any { file ->
-                    Timber.i("Checking for " + "${getFilePrefix(file, fileList)} in ${localUserFiles.keys}")
-
-                    localUserFiles[getFilePrefix(file, fileList)]?.let { localUserFile ->
-                        localUserFile.firstOrNull {
-                            Timber.i("Comparing ${file.filename} and ${it.filename}")
-
-                            it.filename == file.filename
-                        }?.let {
-                            Timber.i("Comparing SHA of ${getFilePrefixPath(file, fileList)} and ${it.prefixPath}")
-                            Timber.i("[${file.shaFile.joinToString(", ")}]\n[${it.sha.joinToString(", ")}]")
-
-                            !file.shaFile.contentEquals(it.sha)
-                        }
-                    } == true
-                }
-            }
-
         val getLocalUserFilesAsPrefixMap: suspend () -> Map<String, List<UserFileInfo>> = {
             val savePatterns = appInfo.ufs.saveFilePatterns.filter { userFile -> userFile.root.isWindows }
 
@@ -568,7 +580,7 @@ object SteamAutoCloud {
         val fileChangeListToUserFiles: (AppFileChangeList) -> List<UserFileInfo> = { appFileListChange ->
             val pathTypePairs = getPathTypePairs(appFileListChange)
 
-            appFileListChange.files.map {
+            appFileListChange.files.filterNot { it.isTombstoned() }.map {
                 UserFileInfo(
                     root = if (it.hasPathPrefixIndex && it.pathPrefixIndex < pathTypePairs.size) {
                         PathType.from(pathTypePairs[it.pathPrefixIndex].first)
@@ -669,7 +681,12 @@ object SteamAutoCloud {
                 var filesUploaded = 0
                 var bytesUploaded = 0L
 
-                val filesToDelete = fileChanges.filesDeleted.map { it.prefixPath }
+                // Overlapping UFS rules can leave multiple cached spellings of the same cloud
+                // path. Steam treats those keys case-insensitively, so issue one delete while
+                // preserving the first original spelling as the RPC representative.
+                val filesToDelete = fileChanges.filesDeleted
+                    .map { it.prefixPath }
+                    .distinctBy { canonicalCloudKey(it) }
 
                 val filesToUpload = fileChanges.filesCreated
                     .union(fileChanges.filesModified)
@@ -684,31 +701,62 @@ object SteamAutoCloud {
                         "and ${filesToUpload.size} file(s) to upload",
                 )
 
-                val uploadBatchResponse = steamCloud.beginAppUploadBatch(
-                    appId = appInfo.id,
-                    machineName = SteamUtils.getMachineName(steamInstance),
-                    clientId = clientId,
-                    filesToDelete = filesToDelete,
-                    filesToUpload = filesToUpload.map { it.first },
-                    appBuildId = appInfo.branches[SteamService.getInstalledApp(appInfo.id)?.branch ?: "public"]?.buildId ?: 0,
-                ).await()
+                val batchKey = openUploadBatchKey(appInfo.id)
+                val uploadBatchResponse = withContext(NonCancellable) {
+                    steamCloud.beginAppUploadBatch(
+                        appId = appInfo.id,
+                        machineName = SteamUtils.getMachineName(steamInstance),
+                        clientId = clientId,
+                        filesToDelete = filesToDelete,
+                        filesToUpload = filesToUpload.map { it.first },
+                        appBuildId = appInfo.branches[SteamService.getInstalledApp(appInfo.id)?.branch ?: "public"]?.buildId ?: 0,
+                    ).await().also { openedBatch ->
+                        if (openedBatch.batchID != 0L) {
+                            try {
+                                // Record before cancellation can resume, so this or a later session
+                                // can always close a batch Steam has already opened.
+                                PrefManager.setLongBlocking(batchKey, openedBatch.batchID)
+                            } catch (e: Exception) {
+                                steamCloud.completeAppUploadBatch(
+                                    appId = appInfo.id,
+                                    batchId = openedBatch.batchID,
+                                    batchEResult = EResult.Fail,
+                                ).await()
+                                throw e
+                            }
+                        }
+                    }
+                }
 
                 // AppUploadBatchResponse does not expose the response EResult, so an unset batch id
                 // is the only signal we get that Steam refused to open the batch. Uploading into it
                 // would be a no-op, and there is no batch to complete afterwards.
                 if (uploadBatchResponse.batchID == 0L) {
+                    currentCoroutineContext().ensureActive()
                     Timber.e("Steam did not open an upload batch for ${appInfo.id}, aborting upload")
 
                     return@async UserFilesUploadResult(false, uploadBatchResponse.appChangeNumber, 0, 0L)
                 }
 
-                // Recorded before the first transfer so that a session killed mid-upload can still
-                // close this batch on its next run.
-                PrefManager.setLongBlocking(openUploadBatchKey(appInfo.id), uploadBatchResponse.batchID)
-
                 var uploadBatchSuccess = true
 
                 try {
+                    // This checkpoint is deliberately inside the finally-protected region. A
+                    // cancellation that arrived while the non-cancellable open was in flight must
+                    // close the now-known batch before it propagates.
+                    currentCoroutineContext().ensureActive()
+
+                    // Listing a path in filesToDelete only declares the batch intent. Steam still
+                    // requires each deletion to be issued inside the opened batch; otherwise the
+                    // batch can complete successfully while the remote file remains untouched.
+                    filesToDelete.forEach { path ->
+                        val deleted = steamCloud.deleteFile(appInfo.id, path, uploadBatchResponse.batchID).await()
+                        if (!deleted) {
+                            Timber.w("Steam refused to delete $path of ${appInfo.id}")
+                            uploadBatchSuccess = false
+                        }
+                    }
+
                     filesToUpload.map { it.second }.forEachIndexed { index, file ->
                         val absFilePath = file.getAbsPath(prefixToPath)
 
@@ -917,7 +965,7 @@ object SteamAutoCloud {
                             batchEResult = batchEResult,
                         ).await()
 
-                        PrefManager.setLongBlocking(openUploadBatchKey(appInfo.id), 0L)
+                        PrefManager.setLongBlocking(batchKey, 0L)
                     }
                 }
 
@@ -963,10 +1011,27 @@ object SteamAutoCloud {
             val cachedFileList = getCachedFileList(steamInstance, appInfo.id)
             val cacheIsAbsentOrEmpty = cachedFileList == null || cachedFileList.userFileInfo.isEmpty()
             val changeNumber = if (!cacheIsAbsentOrEmpty && localAppChangeNumber >= 0) localAppChangeNumber else 0L
-            val appFileListChange = steamCloud.getAppFileListChange(appInfo.id, changeNumber).await()
+            val initialFileListChange = steamCloud.getAppFileListChange(appInfo.id, changeNumber).await()
+            val appFileListChange = if (initialFileListChange.isOnlyDelta) {
+                // The rest of this sync reconciles the cloud set against every local file. Treating
+                // a delta as that set makes every unchanged cloud file look deleted locally.
+                Timber.i("Steam returned a delta for ${appInfo.id}; resolving the full cloud manifest")
+                steamCloud.getAppFileListChange(appInfo.id, 0L).await().also { fullFileList ->
+                    check(!fullFileList.isOnlyDelta) {
+                        "Steam returned a partial cloud manifest for ${appInfo.id} after a full-manifest request"
+                    }
+                }
+            } else {
+                initialFileListChange
+            }
 
             val cloudAppChangeNumber = appFileListChange.currentChangeNumber
             lastCloudAppChangeNumber = cloudAppChangeNumber
+            val activeCloudFiles = appFileListChange.files.filterNot { it.isTombstoned() }
+            val tombstonedCloudKeys = appFileListChange.files
+                .filter { it.isTombstoned() }
+                .map { canonicalCloudKey(getFilePrefixPath(it, appFileListChange)) }
+                .toSet()
 
             Timber.i("AppChangeNumber: $localAppChangeNumber -> $cloudAppChangeNumber")
 
@@ -980,6 +1045,12 @@ object SteamAutoCloud {
                 localUserFilesMap = getLocalUserFilesAsPrefixMap()
                 allLocalUserFiles = localUserFilesMap.map { it.value }.flatten()
             }.inWholeMicroseconds
+            val syncableLocalUserFiles = allLocalUserFiles.filterNot {
+                canonicalCloudKey(it.prefixPath) in tombstonedCloudKeys
+            }
+            val syncableCachedUserFiles = cachedFileList?.userFileInfo?.filterNot {
+                canonicalCloudKey(it.prefixPath) in tombstonedCloudKeys
+            }
 
             val effectiveLocalChangeNumber = if (cacheIsAbsentOrEmpty && allLocalUserFiles.isNotEmpty()) {
                 Timber.w("Cache absent/empty but local files exist — forcing full cloud fetch (storedCn=$localAppChangeNumber)")
@@ -993,7 +1064,7 @@ object SteamAutoCloud {
                     Timber.i("Downloading cloud user files")
 
                     val remoteUserFiles = fileChangeListToUserFiles(appFileListChange)
-                    val filesDiff = getFilesDiff(remoteUserFiles, allLocalUserFiles).second
+                    val filesDiff = getFilesDiff(remoteUserFiles, syncableLocalUserFiles).second
                     microsecDeleteFiles = measureTime {
                         var totalFilesDeleted = 0
 
@@ -1005,17 +1076,17 @@ object SteamAutoCloud {
                         filesDeleted = totalFilesDeleted
                     }.inWholeMicroseconds
 
+                    val allCloudFilesDownloaded: Boolean
                     microsecDownloadFiles = measureTime {
-                        val downloadInfo = downloadFiles(appFileListChange.files, appFileListChange, parentScope).await()
+                        val downloadInfo = downloadFiles(activeCloudFiles, appFileListChange, parentScope).await()
                         filesDownloaded = downloadInfo.filesDownloaded
                         bytesDownloaded = downloadInfo.bytesDownloaded
+                        allCloudFilesDownloaded = downloadInfo.filesDownloaded == activeCloudFiles.size
                     }.inWholeMicroseconds
 
                     val updatedLocalFiles: Map<String, List<UserFileInfo>>
-                    val hasLocalChanges: Boolean
                     microsecValidateState = measureTime {
                         updatedLocalFiles = getLocalUserFilesAsPrefixMap()
-                        hasLocalChanges = hasHashConflicts(updatedLocalFiles, appFileListChange)
                         filesManaged = updatedLocalFiles.size
                     }.inWholeMicroseconds
 
@@ -1029,7 +1100,7 @@ object SteamAutoCloud {
                     // } while (hasLocalChanges && retries++ < MAX_USER_FILE_RETRIES)
                     //
 
-                    if (hasLocalChanges) {
+                    if (!allCloudFilesDownloaded) {
                         Timber.e("Failed to download latest user files after $MAX_USER_FILE_RETRIES tries")
 
                         syncResult = SyncResult.DownloadFail
@@ -1058,59 +1129,77 @@ object SteamAutoCloud {
                         result.second
                     }
 
-                    uploadsRequired = fileChanges.filesCreated.isNotEmpty() || fileChanges.filesModified.isNotEmpty()
-
-                    // Check up front rather than discovering the limit part-way through a batch:
-                    // everything committed before that point is already on the server and still
-                    // counts. The local set is what the cloud ends up holding after a sync, so
-                    // that is what gets measured.
-                    val quotaViolation = checkQuota(
-                        ufs = appInfo.ufs,
-                        fileCount = allLocalUserFiles.size,
-                        totalBytes = allLocalUserFiles.sumOf { userFile ->
-                            runCatching { Files.size(userFile.getAbsPath(prefixToPath)) }.getOrDefault(0L)
-                        },
-                    )
-
-                    if (quotaViolation != null) {
-                        Timber.e("Not uploading save files of ${appInfo.name}: $quotaViolation")
-                        uploadsCompleted = false
-                        filesManaged = allLocalUserFiles.size
-                        syncResult = SyncResult.QuotaExceeded
-                        return@async
-                    }
-
-                    val uploadResult: UserFilesUploadResult
-
                     // Steam de-lists a cloud file by marking it Forgotten or Deleted rather than
                     // dropping it from the list. FileForget is Valve's sanctioned way to free
                     // quota without touching the user's local copy, so that local file is still
                     // on disk and still looks like something to upload. Sending it again would
                     // undo the de-listing on the very next sync - the loop the cloud cleanup
                     // exists to break.
-                    val tombstoned = appFileListChange.files
-                        .filter {
-                            it.persistState == ECloudStoragePersistState.k_ECloudStoragePersistStateForgotten ||
-                                it.persistState == ECloudStoragePersistState.k_ECloudStoragePersistStateDeleted
-                        }
-                        .map { getFilePrefixPath(it, appFileListChange) }
-                        .toSet()
-
-                    val uploadableChanges = if (tombstoned.isEmpty()) {
+                    val uploadableChanges = if (tombstonedCloudKeys.isEmpty()) {
                         fileChanges
                     } else {
-                        val skipped = (fileChanges.filesCreated + fileChanges.filesModified)
-                            .count { it.prefixPath in tombstoned }
+                        val skipped = (fileChanges.filesCreated + fileChanges.filesModified + fileChanges.filesDeleted)
+                            .count { canonicalCloudKey(it.prefixPath) in tombstonedCloudKeys }
 
                         if (skipped > 0) {
                             Timber.i("Skipping $skipped file(s) of ${appInfo.id} de-listed in the cloud")
                         }
 
                         fileChanges.copy(
-                            filesCreated = fileChanges.filesCreated.filterNot { it.prefixPath in tombstoned },
-                            filesModified = fileChanges.filesModified.filterNot { it.prefixPath in tombstoned },
+                            filesCreated = fileChanges.filesCreated.filterNot {
+                                canonicalCloudKey(it.prefixPath) in tombstonedCloudKeys
+                            },
+                            filesModified = fileChanges.filesModified.filterNot {
+                                canonicalCloudKey(it.prefixPath) in tombstonedCloudKeys
+                            },
+                            filesDeleted = fileChanges.filesDeleted.filterNot {
+                                canonicalCloudKey(it.prefixPath) in tombstonedCloudKeys
+                            },
                         )
                     }
+
+                    uploadsRequired = uploadableChanges.filesCreated.isNotEmpty() ||
+                        uploadableChanges.filesModified.isNotEmpty()
+                    val hasBatchChanges = uploadsRequired || uploadableChanges.filesDeleted.isNotEmpty()
+                    filesManaged = allLocalUserFiles.size
+
+                    // A tombstone may be the only difference. Advancing the local snapshot avoids
+                    // reopening an empty batch on every sync while keeping the local file intact.
+                    if (!hasBatchChanges) {
+                        uploadsCompleted = true
+                        lastCloudAppChangeNumber = cloudAppChangeNumber
+                        with(steamInstance) {
+                            db.withTransaction {
+                                fileChangeListsDao.insert(appInfo.id, allLocalUserFiles)
+                                changeNumbersDao.insert(appInfo.id, cloudAppChangeNumber)
+                            }
+                        }
+                        return@async
+                    }
+
+                    // A delete-only batch must be allowed even when the remaining local set is
+                    // above quota; quota constrains files being uploaded, not removals.
+                    if (uploadsRequired) {
+                        val quotaEligibleFiles = allLocalUserFiles.filterNot {
+                            canonicalCloudKey(it.prefixPath) in tombstonedCloudKeys
+                        }
+                        val quotaViolation = checkQuota(
+                            ufs = appInfo.ufs,
+                            fileCount = quotaEligibleFiles.size,
+                            totalBytes = quotaEligibleFiles.sumOf { userFile ->
+                                runCatching { Files.size(userFile.getAbsPath(prefixToPath)) }.getOrDefault(0L)
+                            },
+                        )
+
+                        if (quotaViolation != null) {
+                            Timber.e("Not uploading save files of ${appInfo.name}: $quotaViolation")
+                            uploadsCompleted = false
+                            syncResult = SyncResult.QuotaExceeded
+                            return@async
+                        }
+                    }
+
+                    val uploadResult: UserFilesUploadResult
 
                     microsecUploadFiles = measureTime {
                         uploadResult = uploadFiles(uploadableChanges, parentScope).await()
@@ -1126,9 +1215,7 @@ object SteamAutoCloud {
                         Timber.e("Upload batch succeeded with change number ${uploadResult.appChangeNumber}, discarding")
                     }
 
-                    uploadsCompleted = uploadsRequired && uploadRecorded
-
-                    filesManaged = allLocalUserFiles.size
+                    uploadsCompleted = uploadRecorded
 
                     if (uploadRecorded) {
                         lastCloudAppChangeNumber = uploadResult.appChangeNumber
@@ -1159,8 +1246,9 @@ object SteamAutoCloud {
                     val knownKeys = (allLocalUserFiles + (cachedFileList?.userFileInfo ?: emptyList()))
                         .map { it.getAbsPath(prefixToPath).toString().lowercase() }
                         .toSet()
-                    val neverSynced = appFileListChange.files.filter {
-                        getFullFilePath(it, appFileListChange).toString().lowercase() !in knownKeys
+                    val neverSynced = activeCloudFiles.filter { cloudFile ->
+                        val localPath = getFullFilePath(cloudFile, appFileListChange)
+                        localPath.toString().lowercase() !in knownKeys && !Files.exists(localPath)
                     }
 
                     if (neverSynced.isEmpty()) {
@@ -1186,12 +1274,12 @@ object SteamAutoCloud {
                     var hasLocalChanges: Boolean
 
                     microsecAcPrepUserFiles = measureTime {
-                        hasLocalChanges = getCachedFileList(steamInstance, appInfo.id)?.let {
-                            getFilesDiff(allLocalUserFiles, it.userFileInfo).first
+                        hasLocalChanges = syncableCachedUserFiles?.let {
+                            getFilesDiff(syncableLocalUserFiles, it).first
                         } == true
                     }.inWholeMicroseconds
 
-                    val hasUncachedLocalFiles = cacheIsAbsentOrEmpty && allLocalUserFiles.isNotEmpty()
+                    val hasUncachedLocalFiles = cacheIsAbsentOrEmpty && syncableLocalUserFiles.isNotEmpty()
                     var rehydratedSilently = false
                     if (hasUncachedLocalFiles) {
                         // no cache but local files exist. before declaring conflict,
@@ -1205,10 +1293,10 @@ object SteamAutoCloud {
                         // windows paths are case-insensitive; steam cloud and wine may
                         // disagree on case. lowercase the keys so content-identical
                         // files compare equal regardless.
-                        val localByPath = allLocalUserFiles.associate {
+                        val localByPath = syncableLocalUserFiles.associate {
                             it.getAbsPath(prefixToPath).toString().lowercase() to it.sha
                         }
-                        val remoteByPath = appFileListChange.files.associate {
+                        val remoteByPath = activeCloudFiles.associate {
                             getFullFilePath(it, appFileListChange).toString().lowercase() to it.shaFile
                         }
                         val localMatchesRemote = localByPath.keys == remoteByPath.keys &&
@@ -1230,7 +1318,7 @@ object SteamAutoCloud {
                         } else {
                             hasLocalChanges = true
                             conflictUfsVersion = CURRENT_UFS_PARSE_VERSION
-                            remoteTimestamp = appFileListChange.files.map { it.timestamp.time }.maxOrNull() ?: 0L
+                            remoteTimestamp = activeCloudFiles.map { it.timestamp.time }.maxOrNull() ?: 0L
                             localTimestamp = allLocalUserFiles.map { it.timestamp }.maxOrNull() ?: 0L
                         }
                     }
@@ -1267,7 +1355,7 @@ object SteamAutoCloud {
 
                             SaveLocation.None -> {
                                 syncResult = SyncResult.Conflict
-                                remoteTimestamp = appFileListChange.files.map { it.timestamp.time }.maxOrNull() ?: 0L
+                                remoteTimestamp = activeCloudFiles.map { it.timestamp.time }.maxOrNull() ?: 0L
                                 localTimestamp = allLocalUserFiles.map { it.timestamp }.maxOrNull() ?: 0L
                             }
                         }
@@ -1280,9 +1368,9 @@ object SteamAutoCloud {
                 microsecAcExit = measureTime {
                     // var fileChanges: FileChanges? = null
 
-                    val hasLocalChanges = cachedFileList
+                    val hasLocalChanges = syncableCachedUserFiles
                         ?.let {
-                            val result = getFilesDiff(allLocalUserFiles, it.userFileInfo)
+                            val result = getFilesDiff(syncableLocalUserFiles, it)
                             // fileChanges = result.second
                             result.first
                         } == true
@@ -1449,13 +1537,19 @@ object SteamAutoCloud {
             return null
         }
 
+        var temporaryFile: Path? = null
+
         try {
             val totalFileSize = fileDownloadInfo.rawFileSize.toLong()
+            val targetParent = requireNotNull(actualFilePath.parent) {
+                "Cloud save path has no parent: $actualFilePath"
+            }
+            Files.createDirectories(targetParent)
+            val temporaryPath = Files.createTempFile(targetParent, ".cloud-", ".download")
+            temporaryFile = temporaryPath
 
-            val copyToFile: (InputStream) -> Boolean = { input ->
-                Files.createDirectories(actualFilePath.parent)
-
-                FileOutputStream(actualFilePath.toString()).use { fs ->
+            val copyToTemporaryFile: (InputStream) -> Boolean = { input ->
+                FileOutputStream(temporaryPath.toString()).use { fs ->
                     val totalBytesRead = input.copyTo(fs, 8 * 1024) { chunkBytes, _ ->
                         if (totalRawBytes > 0L) {
                             val currentPercent = (
@@ -1473,16 +1567,6 @@ object SteamAutoCloud {
                                 }
                             }
                         }
-                    }
-
-                    // Preserve file timestamp from steamcloud, could fix game save loading, tested Skyrim
-                    try {
-                        fileDownloadInfo.timestamp.let { timestamp ->
-                            val fileTime = FileTime.fromMillis(timestamp.time)
-                            Files.setLastModifiedTime(actualFilePath, fileTime)
-                        }
-                    } catch (e: Exception) {
-                        Timber.w("Failed to set lastModified for $actualFilePath: ${e.message}")
                     }
 
                     if (totalBytesRead != totalFileSize) {
@@ -1504,7 +1588,7 @@ object SteamAutoCloud {
                                 return@withTimeout false
                             }
 
-                            if (!copyToFile(zipInput)) return@withTimeout false
+                            if (!copyToTemporaryFile(zipInput)) return@withTimeout false
 
                             if (zipInput.nextEntry != null) {
                                 Timber.e("Downloaded user file $prefixedPath has more than one zip entry")
@@ -1513,7 +1597,7 @@ object SteamAutoCloud {
                     } ?: return@withTimeout false
                 } else {
                     response.body?.byteStream()?.use { inputStream ->
-                        if (!copyToFile(inputStream)) return@withTimeout false
+                        if (!copyToTemporaryFile(inputStream)) return@withTimeout false
                     } ?: return@withTimeout false
                 }
                 true
@@ -1523,20 +1607,46 @@ object SteamAutoCloud {
                 return null
             }
 
-            val actualSize = Files.size(actualFilePath)
-            if (actualSize != totalFileSize) {
-                Timber.w("Downloaded size for $prefixedPath was $actualSize, expected $totalFileSize - skipping cache seed")
-            } else {
-                hashCacheDao.insert(
-                    SteamFileHashCache(
-                        appId = appInfo.id,
-                        absPath = actualFilePath.pathString,
-                        sizeBytes = actualSize,
-                        mtimeMillis = Files.getLastModifiedTime(actualFilePath).toMillis(),
-                        sha = streamingShaHash(actualFilePath),
-                    ),
-                )
+            val downloadedSize = Files.size(temporaryPath)
+            if (downloadedSize != totalFileSize) {
+                Timber.w("Downloaded size for $prefixedPath was $downloadedSize, expected $totalFileSize")
+                return null
             }
+
+            val downloadedSha = streamingShaHash(temporaryPath)
+            if (!downloadedSha.contentEquals(file.shaFile)) {
+                Timber.w("Downloaded SHA for $prefixedPath did not match Steam's manifest")
+                return null
+            }
+
+            // Preserve file timestamp from steamcloud, could fix game save loading, tested Skyrim.
+            try {
+                val fileTime = FileTime.fromMillis(fileDownloadInfo.timestamp.time)
+                Files.setLastModifiedTime(temporaryPath, fileTime)
+            } catch (e: Exception) {
+                Timber.w("Failed to set lastModified for $actualFilePath: ${e.message}")
+            }
+
+            try {
+                Files.move(
+                    temporaryPath,
+                    actualFilePath,
+                    StandardCopyOption.ATOMIC_MOVE,
+                    StandardCopyOption.REPLACE_EXISTING,
+                )
+            } catch (_: AtomicMoveNotSupportedException) {
+                Files.move(temporaryPath, actualFilePath, StandardCopyOption.REPLACE_EXISTING)
+            }
+
+            hashCacheDao.insert(
+                SteamFileHashCache(
+                    appId = appInfo.id,
+                    absPath = actualFilePath.pathString,
+                    sizeBytes = downloadedSize,
+                    mtimeMillis = Files.getLastModifiedTime(actualFilePath).toMillis(),
+                    sha = downloadedSha,
+                ),
+            )
 
             val finishedFiles = completedFiles.incrementAndGet()
             val finalProgress = if (totalRawBytes > 0L) {
@@ -1562,6 +1672,10 @@ object SteamAutoCloud {
             Timber.w("Could not download $actualFilePath: %s", e.message)
             return null
         } finally {
+            temporaryFile?.let { path ->
+                runCatching { Files.deleteIfExists(path) }
+                    .onFailure { Timber.w(it, "Could not remove incomplete cloud download $path") }
+            }
             response.close()
         }
     }

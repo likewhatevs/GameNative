@@ -26,7 +26,7 @@ import `in`.dragonbra.javasteam.types.KeyValue
 import java.util.Date
 import timber.log.Timber
 
-const val CURRENT_UFS_PARSE_VERSION = 4
+const val CURRENT_UFS_PARSE_VERSION = 5
 
 /**
  * Extension functions relating to [KeyValue] as the receiver type.
@@ -181,7 +181,7 @@ fun KeyValue.generateSteamApp(): SteamApp {
             }
 
             UFS(
-                quota = this["ufs"]["quota"].asInteger(),
+                quota = this["ufs"]["quota"].asLong(),
                 maxNumFiles = this["ufs"]["maxnumfiles"].asInteger(),
                 saveFilePatterns = this["ufs"]["savefiles"].children.mapNotNull { saveFile ->
                     val platforms = saveFile["platforms"].children.map { it.value?.lowercase() }
