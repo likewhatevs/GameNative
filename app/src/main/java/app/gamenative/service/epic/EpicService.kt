@@ -491,18 +491,21 @@ class EpicService : Service() {
                     } else {
                         val error = result.exceptionOrNull()
                         Timber.e(error, "[Download] Failed for game $gameId")
+                        downloadInfo.persistProgressSnapshot(force = true)
                         downloadInfo.setProgress(-1.0f)
                         downloadInfo.setActive(false)
 
                         SnackbarManager.show("Download failed: ${error?.message ?: "Unknown error"}")
                     }
                 } catch (e: CancellationException) {
+                    downloadInfo.persistProgressSnapshot(force = true)
                     downloadInfo.setPostInstallSyncing(false)
                     downloadInfo.updateStatusMessage(null)
                     PluviaApp.events.emit(AndroidEvent.PostInstallSyncStatusChanged(gameId, false))
                     throw e
                 } catch (e: Exception) {
                     Timber.e(e, "[Download] Exception for game $gameId")
+                    downloadInfo.persistProgressSnapshot(force = true)
                     downloadInfo.setPostInstallSyncing(false)
                     downloadInfo.updateStatusMessage(null)
                     PluviaApp.events.emit(AndroidEvent.PostInstallSyncStatusChanged(gameId, false))

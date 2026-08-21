@@ -38,6 +38,7 @@ data class DownloadInfo(
     private var lastPersistedBytes: Long = 0L
     private var hasPersisted: Boolean = false
     private var persistenceGeneration: Long = 0L
+    private var persistenceFinalized: Boolean = false
 
     private data class SpeedSample(val timeMs: Long, val bytes: Long)
 
@@ -141,6 +142,10 @@ data class DownloadInfo(
      */
     @Synchronized
     fun persistProgressSnapshot(force: Boolean = false) {
+        // A successful install permanently retires this DownloadInfo's resume file. Late
+        // depot callbacks, service teardown, or an asynchronously dispatched cancel must not
+        // recreate it after completion has committed the install.
+        if (persistenceFinalized) return
         val path = persistencePath ?: return
         val now = timeSourceMs()
         val throttled = hasPersisted &&
@@ -165,7 +170,7 @@ data class DownloadInfo(
      */
     @Synchronized
     private fun persistCancellationSnapshot(expectedGeneration: Long) {
-        if (expectedGeneration != persistenceGeneration) return
+        if (persistenceFinalized || expectedGeneration != persistenceGeneration) return
         persistProgressSnapshot(force = true)
     }
 
@@ -380,6 +385,7 @@ data class DownloadInfo(
      */
     @Synchronized
     fun clearPersistedBytesDownloaded(appDirPath: String) {
+        persistenceFinalized = true
         persistenceGeneration += 1L
         try {
             val file = File(File(appDirPath, PERSISTENCE_DIR), PERSISTENCE_FILE)

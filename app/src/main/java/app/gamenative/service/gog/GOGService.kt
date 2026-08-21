@@ -377,6 +377,7 @@ class GOGService : Service() {
                     if (result.isFailure) {
                         val error = result.exceptionOrNull()
                         Timber.e(error, "[Download] Failed for game $gameId")
+                        downloadInfo.persistProgressSnapshot(force = true)
                         downloadInfo.setProgress(-1.0f)
                         downloadInfo.setActive(false)
 
@@ -418,12 +419,14 @@ class GOGService : Service() {
                         downloadInfo.setActive(false)
                     }
                 } catch (e: CancellationException) {
+                    downloadInfo.persistProgressSnapshot(force = true)
                     downloadInfo.setPostInstallSyncing(false)
                     downloadInfo.updateStatusMessage(null)
                     PluviaApp.events.emit(AndroidEvent.PostInstallSyncStatusChanged(gameId.toIntOrNull() ?: -1, false))
                     throw e
                 } catch (e: Exception) {
                     Timber.e(e, "[Download] Exception for game $gameId")
+                    downloadInfo.persistProgressSnapshot(force = true)
                     downloadInfo.setPostInstallSyncing(false)
                     downloadInfo.updateStatusMessage(null)
                     PluviaApp.events.emit(AndroidEvent.PostInstallSyncStatusChanged(gameId.toIntOrNull() ?: -1, false))

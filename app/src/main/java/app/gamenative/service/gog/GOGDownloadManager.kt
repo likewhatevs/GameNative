@@ -589,7 +589,6 @@ class GOGDownloadManager @Inject constructor(
             if (game != null) {
                 val installSize = calculateDirectorySize(installPath)
                 gogManager.updateGame(game.copy(isInstalled = true, installPath = installPath.absolutePath, installSize = installSize))
-                downloadInfo.clearPersistedBytesDownloaded(installPath.absolutePath)
                 Timber.tag("GOG").i("Updated database: game marked as installed, size: ${installSize / 1_000_000} MB")
             } else {
                 Timber.tag("GOG").w("Game $gameId not found in database, skipping DB update")
@@ -597,6 +596,10 @@ class GOGDownloadManager @Inject constructor(
         } catch (e: Exception) {
             Timber.tag("GOG").e(e, "Failed to update database for game $gameId")
         }
+        // The files are complete even if the non-fatal database refresh failed. Retire the
+        // resume snapshot before publishing the completion marker so no late terminal callback
+        // can recreate stale progress for an already-installed game.
+        downloadInfo.clearPersistedBytesDownloaded(installPath.absolutePath)
         downloadInfo.updateStatusMessage("Complete")
         downloadInfo.setProgress(1.0f)
         downloadInfo.setActive(false)

@@ -142,6 +142,7 @@ import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 import javax.inject.Inject
 import kotlin.io.path.pathString
 import kotlin.time.Duration.Companion.seconds
@@ -527,19 +528,52 @@ class SteamService : Service(), IChallengeUrlChanged {
         // Every read used to re-query DataStore (a blocking read) and rebuild the list. The
         // inputs only change when the storage prefs or the mounted volume set change, both of
         // which call invalidateInstallPathCaches().
+        private data class InstallPathsCacheEntry(
+            val epoch: Long,
+            val paths: List<String>,
+        )
+
+        private data class AppCacheEntry<T>(
+            val rootsEpoch: Long,
+            val appEpoch: Long,
+            val value: T,
+        )
+
+        /** Invalidates an in-flight install-root computation as well as an already cached one. */
+        private val installRootsEpoch = AtomicLong(0L)
+
+        /** Per-app epochs prevent a slow resolution from republishing after that app is invalidated. */
+        private val appCacheEpochs = ConcurrentHashMap<Int, AtomicLong>()
+
         @Volatile
-        private var cachedInstallPaths: List<String>? = null
+        private var cachedInstallPaths: InstallPathsCacheEntry? = null
 
         // Resolved install directory per appId. Resolving it walks Room, DataStore and the
         // filesystem, which on SD-card installs is slow enough to ANR the caller.
-        private val appDirPathCache = ConcurrentHashMap<Int, String>()
+        private val appDirPathCache = ConcurrentHashMap<Int, AppCacheEntry<String>>()
 
         // Last known result of isAppInstalled, so UI can seed state without blocking.
-        private val appInstalledCache = ConcurrentHashMap<Int, Boolean>()
+        private val appInstalledCache = ConcurrentHashMap<Int, AppCacheEntry<Boolean>>()
 
         // all install paths: internal + configured external + all mounted volumes
         val allInstallPaths: List<String>
-            get() = cachedInstallPaths ?: computeInstallPaths().also { cachedInstallPaths = it }
+            get() {
+                while (true) {
+                    val epoch = installRootsEpoch.get()
+                    cachedInstallPaths
+                        ?.takeIf { it.epoch == epoch }
+                        ?.let { return it.paths }
+
+                    val paths = computeInstallPaths()
+                    if (installRootsEpoch.get() != epoch) continue
+
+                    cachedInstallPaths = InstallPathsCacheEntry(epoch, paths)
+                    // Invalidation may have landed between the check and publication. The
+                    // versioned entry is harmless, but do not return it as a post-invalidation
+                    // answer; retry against the new roots instead.
+                    if (installRootsEpoch.get() == epoch) return paths
+                }
+            }
 
         private fun computeInstallPaths(): List<String> {
             val paths = mutableListOf(internalAppInstallPath)
@@ -561,6 +595,7 @@ class SteamService : Service(), IChallengeUrlChanged {
          * preference writes and volume (re)discovery.
          */
         fun invalidateInstallPathCaches() {
+            installRootsEpoch.incrementAndGet()
             cachedInstallPaths = null
             appDirPathCache.clear()
             appInstalledCache.clear()
@@ -571,9 +606,13 @@ class SteamService : Service(), IChallengeUrlChanged {
          * directory or its markers change: install start, install completion, deletion.
          */
         fun invalidateAppDirCache(appId: Int) {
+            appCacheEpochs.computeIfAbsent(appId) { AtomicLong(0L) }.incrementAndGet()
             appDirPathCache.remove(appId)
             appInstalledCache.remove(appId)
         }
+
+        private fun appCacheEpoch(appId: Int): AtomicLong =
+            appCacheEpochs.computeIfAbsent(appId) { AtomicLong(0L) }
 
         private val internalAppStagingPath: String
             get() {
@@ -819,9 +858,19 @@ class SteamService : Service(), IChallengeUrlChanged {
         }
 
         fun isAppInstalled(appId: Int): Boolean {
-            val installed = MarkerUtils.hasMarker(getAppDirPath(appId), Marker.DOWNLOAD_COMPLETE_MARKER)
-            appInstalledCache[appId] = installed
-            return installed
+            while (true) {
+                val rootsEpoch = installRootsEpoch.get()
+                val appEpochRef = appCacheEpoch(appId)
+                val appEpoch = appEpochRef.get()
+                val installed = MarkerUtils.hasMarker(getAppDirPath(appId), Marker.DOWNLOAD_COMPLETE_MARKER)
+                if (installRootsEpoch.get() != rootsEpoch || appEpochRef.get() != appEpoch) continue
+
+                val entry = AppCacheEntry(rootsEpoch, appEpoch, installed)
+                appInstalledCache[appId] = entry
+                if (installRootsEpoch.get() == rootsEpoch && appEpochRef.get() == appEpoch) {
+                    return installed
+                }
+            }
         }
 
         /**
@@ -830,7 +879,13 @@ class SteamService : Service(), IChallengeUrlChanged {
          * DataStore, so it is safe to call during composition; callers must still run
          * [isAppInstalled] off the main thread to get an authoritative answer.
          */
-        fun peekAppInstalled(appId: Int): Boolean? = appInstalledCache[appId]
+        fun peekAppInstalled(appId: Int): Boolean? {
+            val rootsEpoch = installRootsEpoch.get()
+            val appEpoch = appCacheEpoch(appId).get()
+            return appInstalledCache[appId]
+                ?.takeIf { it.rootsEpoch == rootsEpoch && it.appEpoch == appEpoch }
+                ?.value
+        }
 
         fun getAppDlc(appId: Int): Map<Int, DepotInfo> {
             return getAppInfoOf(appId)?.let {
@@ -1223,13 +1278,28 @@ class SteamService : Service(), IChallengeUrlChanged {
         }
 
         fun getAppDirPath(gameId: Int): String {
-            appDirPathCache[gameId]?.let { return it }
-            val resolved = resolveAppDirPath(gameId)
-            // Only memoise answers derived from a real app record. Before the Steam app
-            // info is in Room, or for an imported app with a blank path, resolution
-            // degrades to the bare install root — caching that would pin it permanently.
-            if (resolved.cacheable) appDirPathCache[gameId] = resolved.path
-            return resolved.path
+            while (true) {
+                val rootsEpoch = installRootsEpoch.get()
+                val appEpochRef = appCacheEpoch(gameId)
+                val appEpoch = appEpochRef.get()
+                appDirPathCache[gameId]
+                    ?.takeIf { it.rootsEpoch == rootsEpoch && it.appEpoch == appEpoch }
+                    ?.let { return it.value }
+
+                val resolved = resolveAppDirPath(gameId)
+                if (installRootsEpoch.get() != rootsEpoch || appEpochRef.get() != appEpoch) continue
+
+                // Only memoise answers derived from a real app record. Before the Steam app
+                // info is in Room, or for an imported app with a blank path, resolution
+                // degrades to the bare install root — caching that would pin it permanently.
+                if (!resolved.cacheable) return resolved.path
+
+                val entry = AppCacheEntry(rootsEpoch, appEpoch, resolved.path)
+                appDirPathCache[gameId] = entry
+                if (installRootsEpoch.get() == rootsEpoch && appEpochRef.get() == appEpoch) {
+                    return resolved.path
+                }
+            }
         }
 
         private class ResolvedAppDir(val path: String, val cacheable: Boolean)
@@ -2031,8 +2101,16 @@ class SteamService : Service(), IChallengeUrlChanged {
                 notifyDownloadStarted(appId)
                 instance?.notifierOrNull?.trackDownload(di, getAppInfoOf(appId)?.name.orEmpty(), NotificationHelper.NOTIFICATION_ID_STEAM)
 
+                val usesInternalStorage = DownloadService.baseDataDirPath
+                    .takeIf { it.isNotBlank() }
+                    ?.let { internalRoot ->
+                        runCatching {
+                            Paths.get(appDirPath).normalize().startsWith(Paths.get(internalRoot).normalize())
+                        }.getOrDefault(false)
+                    }
+                    ?: false
                 val chunkStagingRedirectDir = File(DownloadService.baseCacheDirPath, "depot_chunks/$appId")
-                    .takeIf { !appDirPath.startsWith(DownloadService.baseDataDirPath) }
+                    .takeUnless { usesInternalStorage }
 
                 val downloadJob = instance!!.scope.launch {
                     try {
@@ -2079,7 +2157,7 @@ class SteamService : Service(), IChallengeUrlChanged {
                                 add(
                                     AppItem(
                                         appId,
-                                        installDirectory = getAppDirPath(appId),
+                                        installDirectory = appDirPath,
                                         depot = mainAppDepots.keys.sorted(),
                                         branch = branch,
                                         branchPassword = branchPassword,
@@ -2095,7 +2173,7 @@ class SteamService : Service(), IChallengeUrlChanged {
                                 add(
                                     AppItem(
                                         dlcAppId,
-                                        installDirectory = getAppDirPath(appId),
+                                        installDirectory = appDirPath,
                                         depot = dlcDepotIds,
                                         branch = branch,
                                         branchPassword = branchPassword,
@@ -2130,12 +2208,16 @@ class SteamService : Service(), IChallengeUrlChanged {
                                 ),
                             )
 
-                            depotDownloader.addListener(AppDownloadListener(di, depotIdToIndex))
-                            depotDownloader.add(appItem)
-                            depotDownloader.finishAdding()
-                            depotDownloader.startDownloading()
-                            depotDownloader.getCompletion().await()
-                            depotDownloader.close()
+                            try {
+                                depotDownloader.addListener(AppDownloadListener(di, depotIdToIndex))
+                                depotDownloader.add(appItem)
+                                depotDownloader.finishAdding()
+                                depotDownloader.startDownloading()
+                                depotDownloader.getCompletion().await()
+                            } finally {
+                                runCatching { depotDownloader.close() }
+                                    .onFailure { Timber.w(it, "Failed to close DepotDownloader for app ${appItem.appId}") }
+                            }
                         }
 
                         val appConfig = getAppInfoOf(appId)?.config
@@ -3859,18 +3941,22 @@ class SteamService : Service(), IChallengeUrlChanged {
     override fun onDestroy() {
         super.onDestroy()
 
-        // Persist download progress for all active downloads
-        // This is a safety net for OS kills (unlikely but possible)
-        downloadJobs.values.forEach { downloadInfo ->
-            downloadInfo.persistProgressSnapshot(force = true)
-        }
+        val downloadsToPersist = downloadJobs.values.toList()
 
         stopForeground(STOP_FOREGROUND_REMOVE)
         notificationHelper.cancel()
 
         connectivityManager.unregisterNetworkCallback(networkCallback)
 
-        scope.launch { stop() }
+        scope.launch {
+            try {
+                // This is a safety net for OS kills. The snapshot can live on a saturated SD
+                // card, so never perform these terminal writes on Service.onDestroy's main thread.
+                downloadsToPersist.forEach { it.persistProgressSnapshot(force = true) }
+            } finally {
+                stop()
+            }
+        }
     }
 
     override fun onTaskRemoved(rootIntent: Intent?) {

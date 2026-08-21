@@ -152,7 +152,14 @@ object PrefManager {
         }
     }
 
-    fun clearPreferences() = mutate { it.clear() }
+    fun clearPreferences() {
+        // Retire favorite serializations that were launched before this reset but have not
+        // reached the ordered preference queue yet, or they could repopulate a cleared store.
+        synchronized(favoritePersistenceLock) {
+            favoritePersistenceVersion += 1
+        }
+        mutate { it.clear() }
+    }
 
     /**
      * Clears only Steam account/session state while preserving app-wide settings.
@@ -260,11 +267,21 @@ object PrefManager {
      * for disk, so both always agree and writes land in call order.
      */
     private fun mutate(onCommitted: (() -> Unit)? = null, block: (MutablePreferences) -> Unit) {
+        mutateIf(predicate = { true }, onCommitted = onCommitted, block = block)
+    }
+
+    /** Atomically applies and queues [block] only while [predicate] still matches the snapshot. */
+    private fun mutateIf(
+        predicate: (Preferences) -> Boolean,
+        onCommitted: (() -> Unit)? = null,
+        block: (MutablePreferences) -> Unit,
+    ): Boolean {
         // Outside the lock: the mutation has to be applied on top of the stored
         // values, and loading them can block.
         awaitSnapshot()
 
-        synchronized(stateLock) {
+        return synchronized(stateLock) {
+            if (!predicate(snapshot)) return@synchronized false
             val updated = snapshot.toMutablePreferences()
             block(updated)
             snapshot = updated.toPreferences()
@@ -272,6 +289,7 @@ object PrefManager {
             if (queued.isFailure) {
                 Timber.e("Could not queue a preference write, it will not be persisted")
             }
+            true
         }
     }
 
@@ -1434,6 +1452,16 @@ object PrefManager {
             setPref(EXTERNAL_STORAGE_PATH, value)
         }
 
+    /** Used by the startup migration so a slow SD operation cannot overwrite a newer choice. */
+    internal fun compareAndSetExternalStoragePath(expected: String, value: String): Boolean {
+        val changed = mutateIf(
+            predicate = { preferences -> (preferences[EXTERNAL_STORAGE_PATH] ?: "") == expected },
+            block = { preferences -> preferences[EXTERNAL_STORAGE_PATH] = value },
+        )
+        if (changed) SteamService.invalidateInstallPathCaches()
+        return changed
+    }
+
     private val FRONTEND_SYNC_DIR_STEAM = stringPreferencesKey("frontend_sync_dir_steam")
     private val FRONTEND_SYNC_DIR_EPIC = stringPreferencesKey("frontend_sync_dir_epic")
     private val FRONTEND_SYNC_DIR_GOG = stringPreferencesKey("frontend_sync_dir_gog")
@@ -1529,13 +1557,12 @@ object PrefManager {
             }
             scope.launch {
                 val serialized = Json.encodeToString(value)
-                val isLatest = synchronized(favoritePersistenceLock) {
-                    version == favoritePersistenceVersion
-                }
-                if (isLatest) {
-                    // Reads are served from the authoritative in-memory snapshot. A direct
-                    // DataStore edit would reach disk but remain invisible for this process.
-                    setPref(FAVORITE_APP_IDS, serialized)
+                synchronized(favoritePersistenceLock) {
+                    if (version == favoritePersistenceVersion) {
+                        // Reads are served from the authoritative in-memory snapshot. A direct
+                        // DataStore edit would reach disk but remain invisible for this process.
+                        setPref(FAVORITE_APP_IDS, serialized)
+                    }
                 }
             }
         }

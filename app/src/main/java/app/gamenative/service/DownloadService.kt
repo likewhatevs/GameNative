@@ -27,6 +27,7 @@ object DownloadService {
         }
 
     // all mounted non-primary external volumes (SD cards, USB), discovered at init
+    @Volatile
     var externalVolumePaths: List<String> = emptyList()
         private set
 
@@ -82,8 +83,13 @@ object DownloadService {
         if (pref.isBlank() || !pref.contains("/Android/data/")) return@withContext
         val public = StorageUtils.publicInstallRoot(File(pref)) ?: return@withContext
         if (StorageUtils.ensureInstallRoot(public)) {
-            Timber.i("Migrating external install root from $pref to ${public.absolutePath}")
-            PrefManager.externalStoragePath = public.absolutePath
+            // Volume discovery and directory creation can be slow enough for the user to choose
+            // another target meanwhile. Never overwrite a preference that changed in flight.
+            if (PrefManager.compareAndSetExternalStoragePath(pref, public.absolutePath)) {
+                Timber.i("Migrating external install root from $pref to ${public.absolutePath}")
+            } else {
+                Timber.i("External install root changed while migration was running; leaving it unchanged")
+            }
         }
     }
 
