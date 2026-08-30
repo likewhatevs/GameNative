@@ -17,6 +17,7 @@ import androidx.datastore.preferences.preferencesDataStore
 import app.gamenative.data.GameSource
 import app.gamenative.powercontrol.autotuning.DeviceGate
 import app.gamenative.enums.AppTheme
+import app.gamenative.service.SteamService
 import app.gamenative.ui.enums.AppFilter
 import app.gamenative.ui.enums.HomeDestination
 import app.gamenative.ui.enums.Orientation
@@ -1378,14 +1379,9 @@ object PrefManager {
 
     private val REC_DISCLOSURE_SHOWN = booleanPreferencesKey("rec_disclosure_shown")
 
-    // Cached in memory because the DataStore write is async: consumers read this back
-    // immediately after granting consent, before the write lands on disk.
-    @Volatile private var recDisclosureShownCache: Boolean? = null
     var recDisclosureShown: Boolean
-        get() = recDisclosureShownCache
-            ?: getPref(REC_DISCLOSURE_SHOWN, false).also { recDisclosureShownCache = it }
+        get() = getPref(REC_DISCLOSURE_SHOWN, false)
         set(value) {
-            recDisclosureShownCache = value
             setPref(REC_DISCLOSURE_SHOWN, value)
         }
 
@@ -1434,8 +1430,13 @@ object PrefManager {
     var useExternalStorage: Boolean
         get() = getPref(USE_EXTERNAL_STORAGE, false)
         set(value) {
+            // Invalidate after both writes, never before: setPref publishes to the in-memory
+            // snapshot before it returns, so anything reading once these have returned
+            // resolves against the new roots. Invalidating first would let a reader racing
+            // between the two re-cache the old roots permanently.
             setPref(USE_EXTERNAL_STORAGE, value)
             setPref(EXTERNAL_STORAGE_PATH, "")
+            SteamService.invalidateInstallPathCaches()
         }
 
     private val FETCH_STEAMGRIDDB_IMAGES = booleanPreferencesKey("fetch_steamgriddb_images")
@@ -1450,6 +1451,7 @@ object PrefManager {
         get() = getPref(EXTERNAL_STORAGE_PATH, "")
         set(value) {
             setPref(EXTERNAL_STORAGE_PATH, value)
+            SteamService.invalidateInstallPathCaches()
         }
 
     /** Used by the startup migration so a slow SD operation cannot overwrite a newer choice. */
